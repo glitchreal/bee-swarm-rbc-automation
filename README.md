@@ -12,7 +12,7 @@ Robo Bear Challenge automation for Bee Swarm Simulator. The existing automation 
 - Selects quests, bees, and upgrades using RBC guide priorities.
 - Adapts upgrade choices to the selected quest, current round, attack, capacity, and active Homepage level.
 - Routes multi-color pollen quests through overlapping fields, then switches fields as objectives complete.
-- Holds the equipped tool while farming and places sprinklers after entering a field.
+- Runs the game's `Collectors.LocalCollect` loop while farming, which fires the real `ToolCollect` remote at the equipped collector's cooldown, and places sprinklers after entering a field.
 - Uses a persistent, priority-aware token queue with strict field bounds and stall pathfinding.
 - Finishes owned Precise crosshairs before changing fields.
 - Uses quest-aware materials only when they solve a current weakness: color extracts, emergency late-round potions, field dice, goo support, and instant conversion.

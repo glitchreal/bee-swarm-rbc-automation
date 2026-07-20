@@ -14,7 +14,7 @@ end
 
 local playerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-local SCRIPT_VERSION = "2026.07.19.9"
+local SCRIPT_VERSION = "2026.07.19.10"
 local INSTANCE_KEY = "__RBCQuestDetectorNoAtlas"
 local TWEEN_SPEED_MIN = 20
 local TWEEN_SPEED_MAX = 70
@@ -144,6 +144,7 @@ local state = {
     lastChallengeTimerChangedAt = 0,
     guideDefaultsApplied = false,
     collectorInputHeld = false,
+    lastToolCollectRemoteAt = 0,
     walkSpeedHumanoid = nil,
     originalWalkSpeed = nil,
     tokenQueue = {},
@@ -2545,19 +2546,36 @@ end
 
 function setCollectorInputHeld(enabled)
     enabled = enabled == true
-    if state.collectorInputHeld == enabled then
+    if not enabled and state.collectorInputHeld == false then
         return true
     end
 
-    local camera = Workspace.CurrentCamera
-    local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
-    local x = math.floor(viewport.X * 0.5)
-    local y = math.floor(viewport.Y * 0.3)
+    -- Bee Swarm's collector is driven by LocalCollect, not by the physical
+    -- mouse state alone. StartCollection runs at the equipped collector's
+    -- exact cooldown and calls Events.ClientCall("ToolCollect") every swing.
     local ok = safeCall(function()
-        VirtualInputManager:SendMouseMoveEvent(x, y, game)
-        VirtualInputManager:SendMouseButtonEvent(x, y, 0, enabled, game, 0)
+        local localCollect = require(ReplicatedStorage:WaitForChild("Collectors"):WaitForChild("LocalCollect"))
+        runtime.localCollect = localCollect
+        if enabled then
+            localCollect.StartCollection()
+        else
+            localCollect.StopCollection()
+        end
         return true
     end, false)
+
+    -- Direct remote fallback for executor/game versions where LocalCollect is
+    -- unavailable. The normal path above remains preferred because it applies
+    -- CollectorSpeed and the real tool cooldown.
+    if enabled and not ok then
+        local now = os.clock()
+        if (now - state.lastToolCollectRemoteAt) >= 1 then
+            ok = fireRemote("ToolCollect")
+            if ok then
+                state.lastToolCollectRemoteAt = now
+            end
+        end
+    end
     if ok then
         state.collectorInputHeld = enabled
     end
