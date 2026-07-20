@@ -14,13 +14,20 @@ end
 
 local playerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-local SCRIPT_VERSION = "2026.07.19.10"
+local SCRIPT_VERSION = "2026.07.19.18"
 local INSTANCE_KEY = "__RBCQuestDetectorNoAtlas"
 local TWEEN_SPEED_MIN = 20
 local TWEEN_SPEED_MAX = 70
 local TWEEN_SPEED_DEFAULT = 70
 local TWEEN_SPEED_MULTIPLIER = 1
 local TWEEN_SPEED_LEGACY_RAW_MIN = 71
+local AUTOMATION_UI_SETTLE = 0.32
+local DIALOG_INPUT_INTERVAL = 0.08
+local TOKEN_SCAN_INTERVAL = 0.15
+local TOKEN_REPATH_INTERVAL = 0.04
+local TOKEN_TARGET_TIMEOUT = 3
+local PRECISION_REFRESH_SECONDS = 12
+local TWEEN_TRAVEL_CLEARANCE = 14
 local globalScope = (getgenv and getgenv()) or _G
 local previousInstance = globalScope[INSTANCE_KEY]
 
@@ -40,7 +47,10 @@ local runtime = {
     moveSession = nil,
     preciseFxModule = nil,
     preciseFxOriginalMake = nil,
-    preciseFxWrappedMake = nil
+    preciseFxWrappedMake = nil,
+    preciseBeamTargets = nil,
+    preciseBuffTile = nil,
+    preciseOsTime = nil
 }
 
 globalScope[INSTANCE_KEY] = runtime
@@ -66,6 +76,9 @@ function runtime.cleanup(_reason)
     end
     if setAutoRbcWalkSpeed then
         pcall(setAutoRbcWalkSpeed, false)
+    end
+    if destroyFieldRecovery then
+        pcall(destroyFieldRecovery)
     end
     if runtime.preciseFxModule
         and runtime.preciseFxOriginalMake
@@ -103,7 +116,7 @@ end
 
 local state = {
     autoScan = true,
-    scanInterval = 1.5,
+    scanInterval = 0.5,
     includeHidden = false,
     minimized = false,
     activeTab = "quests",
@@ -140,6 +153,7 @@ local state = {
     lastFarmStallRecoverAt = 0,
     lastRbcFieldSwitchAt = 0,
     lastRbcTaskSignature = "",
+    activeRbcTaskKey = "",
     lastChallengeTimerSeconds = nil,
     lastChallengeTimerChangedAt = 0,
     guideDefaultsApplied = false,
@@ -158,6 +172,8 @@ local state = {
     tokenPathIndex = 0,
     tokenPathTarget = nil,
     lastTokenQueueRefreshAt = 0,
+    tokenQueueDirty = true,
+    lastFarmStatusAt = 0,
     lastSprinklerField = "",
     lastSprinklerAt = 0,
     preciseTargets = setmetatable({}, { __mode = "k" }),
@@ -165,7 +181,15 @@ local state = {
     preciseTouchedObserved = setmetatable({}, { __mode = "k" }),
     preciseSeenCount = 0,
     preciseTouchedCount = 0,
+    preciseMode = "idle",
+    preciseMarkCount = 0,
+    precisionCombo = 0,
+    precisionRemaining = 0,
+    coconutCrabAlive = false,
+    lastCoconutCrabCheckAt = 0,
     lastHiveMoveAt = 0,
+    convertingAtHive = false,
+    convertBagTarget = 0,
     lastRoboBearEAt = 0,
     lastNpcDialogClickAt = 0,
     lastRoboBearRoundStateCheckAt = 0,
@@ -178,7 +202,7 @@ local state = {
     lastRoboBearRoundStartSignature = "",
     waitingForChallengeInfoAfterRoundStart = false,
     lastChallengeInfoWaitStartedAt = 0,
-    actionDelay = 1,
+    actionDelay = AUTOMATION_UI_SETTLE,
     lastQuestChoicesSeenAt = 0,
     lastBeeChoicesSeenAt = 0,
     lastUpgradeChoicesSeenAt = 0,
@@ -2012,10 +2036,14 @@ function chooseQuestIndex(quests, route)
 
     for index, quest in ipairs(quests) do
         local meta = analyzeQuestForRoute(quest, route)
+        meta.estimatedCost = type(estimateQuestCompletionCost) == "function"
+            and estimateQuestCompletionCost(quest)
+            or math.huge
         if not bestMeta
-            or meta.guideRank < bestMeta.guideRank
-            or (meta.guideRank == bestMeta.guideRank and meta.score > bestMeta.score)
-            or (meta.guideRank == bestMeta.guideRank and meta.score == bestMeta.score and meta.taskCount < bestMeta.taskCount) then
+            or meta.estimatedCost < bestMeta.estimatedCost
+            or (meta.estimatedCost == bestMeta.estimatedCost and meta.guideRank < bestMeta.guideRank)
+            or (meta.estimatedCost == bestMeta.estimatedCost and meta.guideRank == bestMeta.guideRank and meta.score > bestMeta.score)
+            or (meta.estimatedCost == bestMeta.estimatedCost and meta.guideRank == bestMeta.guideRank and meta.score == bestMeta.score and meta.taskCount < bestMeta.taskCount) then
             bestIndex = index
             bestMeta = meta
         end
@@ -2271,15 +2299,18 @@ end
 
 function isStandingAtFarmField(fieldName)
     local rootPart = getCharacterRoot()
-    local _, center, size = getFarmFieldTargetPosition(fieldName)
-    if not rootPart or not center or not size then
+    local targetPosition, center, size = getFarmFieldTargetPosition(fieldName)
+    if not rootPart or not targetPosition or not center or not size then
         return false
     end
 
     local delta = rootPart.Position - center
     local horizontalDistance = Vector3.new(delta.X, 0, delta.Z).Magnitude
     local radius = math.max(size.X, size.Z) / 2
-    return horizontalDistance <= (radius + 8) and math.abs(delta.Y) <= math.max(25, size.Y + 12)
+    local fieldSurfaceY = center.Y + size.Y / 2
+    return horizontalDistance <= (radius + 6)
+        and rootPart.Position.Y >= fieldSurfaceY + 0.5
+        and rootPart.Position.Y <= targetPosition.Y + 12
 end
 
 function inferVisibleRbcQuestField()
@@ -2401,7 +2432,85 @@ function inferRbcTaskTargetFromText(text)
     }
 end
 
+function getActiveRbcTaskTargets()
+    local stats = safeCall(function()
+        return require(ReplicatedStorage.ClientStatCache).Get()
+    end, nil)
+    local challenge = stats
+        and stats.RoboChallenges
+        and stats.RoboChallenges.ActiveChallenge
+    local quest = challenge and challenge.ActiveQuest
+    if type(quest) ~= "table" or type(quest.Tasks) ~= "table" then
+        return {}
+    end
+
+    local targets = {}
+    local taskTypes = ReplicatedStorage:FindFirstChild("Quests")
+        and ReplicatedStorage.Quests:FindFirstChild("TaskTypes")
+    for _, questTask in ipairs(quest.Tasks) do
+        local taskType = tostring(questTask.Type or "")
+        local loweredType = string.lower(taskType)
+        -- Preserve every authoritative ActiveQuest task. Routing flags below
+        -- specialize the known RBC types, while any future type still retains
+        -- the game's own description, progress, and completion state.
+        local relevant = true
+        if relevant then
+            local taskModuleScript = taskTypes and taskTypes:FindFirstChild(taskType)
+            local taskModule = taskModuleScript and safeCall(function()
+                return require(taskModuleScript)
+            end, nil)
+            local description = type(taskModule) == "table" and type(taskModule.Description) == "function"
+                and safeCall(function()
+                    return taskModule.Description(questTask, stats)
+                end, "")
+                or tostring(questTask.Description or questTask.Desc or taskType)
+            local goal = tonumber(questTask.Amount) or 0
+            local statValue = type(taskModule) == "table" and type(taskModule.GetStat) == "function"
+                and safeCall(function()
+                    return taskModule.GetStat(questTask, stats)
+                end, nil)
+                or nil
+            local current = statValue and math.max(0, tonumber(statValue) - (tonumber(questTask.StartValue) or 0)) or 0
+            local progress = goal > 0 and math.clamp(current / goal, 0, 1) or 0
+            local zone = tostring(questTask.Zone or "")
+            local explicitFields = zone ~= "" and findFarmFieldsInText(zone) or {}
+            local color = string.lower(tostring(questTask.Color or ""))
+            local defeat = loweredType:find("defeat", 1, true) ~= nil
+                or loweredType:find("monster", 1, true) ~= nil
+            local convert = loweredType:find("convert", 1, true) ~= nil
+                or loweredType:find("honey", 1, true) ~= nil
+            local target = {
+                fieldName = explicitFields[1] or getRouteDefaultFarmField(),
+                mode = convert and "convert" or (defeat and "combat" or "generic"),
+                text = tostring(description),
+                complete = goal > 0 and current >= goal,
+                explicitField = #explicitFields > 0,
+                fields = explicitFields,
+                red = color == "red",
+                blue = color == "blue",
+                white = color == "white" or color == "colorless",
+                goo = loweredType:find("goo", 1, true) ~= nil,
+                convert = convert,
+                defeat = defeat,
+                genericFarm = not defeat and not convert,
+                current = current,
+                goal = goal,
+                progress = progress,
+                remainingRatio = 1 - progress,
+                source = "ActiveQuest"
+            }
+            table.insert(targets, target)
+        end
+    end
+    return targets
+end
+
 function getVisibleRbcTaskTargets()
+    local activeTargets = getActiveRbcTaskTargets()
+    if #activeTargets > 0 then
+        return activeTargets
+    end
+
     local candidates = {}
     local seen = {}
     local roots = {
@@ -2739,6 +2848,39 @@ function registerPreciseTarget(value, visited, depth)
     end
 end
 
+function getLivePreciseBeamTargets()
+    local module = runtime.preciseFxModule
+    if type(module) ~= "table" then
+        return nil
+    end
+
+    local targets = safeCall(function()
+        return debug.getupvalue(module.UpdateBeams, 2)
+    end, nil)
+    if type(targets) ~= "table" then
+        targets = safeCall(function()
+            return debug.getupvalue(module.Touch, 1)
+        end, nil)
+    end
+    if type(targets) == "table" then
+        runtime.preciseBeamTargets = targets
+    end
+    return runtime.preciseBeamTargets
+end
+
+function annotatePreciseTargetFromMake(payload)
+    if type(payload) ~= "table" or payload.ID == nil then
+        return
+    end
+    local targets = getLivePreciseBeamTargets()
+    local target = type(targets) == "table" and targets[payload.ID] or nil
+    if type(target) == "table" then
+        target.Mark = payload.Mark == true
+        target.SpawnedAt = os.clock()
+        state.preciseTargets[target] = os.clock()
+    end
+end
+
 function installAutoPreciseHook()
     if runtime.preciseFxModule then
         return true
@@ -2763,6 +2905,9 @@ function installAutoPreciseHook()
             registerPreciseTarget(args[index])
         end
         local results = table.pack(originalMake(...))
+        for index = 1, args.n do
+            annotatePreciseTargetFromMake(args[index])
+        end
         for index = 1, results.n do
             registerPreciseTarget(results[index])
         end
@@ -2771,18 +2916,78 @@ function installAutoPreciseHook()
     runtime.preciseFxModule = module
     runtime.preciseFxOriginalMake = originalMake
     runtime.preciseFxWrappedMake = wrappedMake
-    runtime.preciseBeamTargets = safeCall(function()
-        local values = table.pack(debug.getupvalue(module.UpdateBeams, 2))
-        if type(values[1]) == "table" then
-            return values[1]
-        end
-        if type(values[2]) == "table" then
-            return values[2]
-        end
-        return nil
-    end, nil)
     module.Make = wrappedMake
+    getLivePreciseBeamTargets()
     return true
+end
+
+function getPreciseBuffState()
+    if not runtime.preciseBuffTile then
+        runtime.preciseBuffTile = safeCall(function()
+            return require(ReplicatedStorage.Gui.TileDisplay.BuffTile)
+        end, nil)
+    end
+    if not runtime.preciseOsTime then
+        runtime.preciseOsTime = safeCall(function()
+            return require(ReplicatedStorage.OsTime)
+        end, nil)
+    end
+
+    local buffTile = runtime.preciseBuffTile
+    local now = type(runtime.preciseOsTime) == "function"
+        and safeCall(runtime.preciseOsTime, os.time())
+        or os.time()
+    -- BuffTile.GetBuffInfo returns multiple values, so read it without safeCall's
+    -- single-value fallback when the module is initialized.
+    local function readLive(name, defaultDuration)
+        if type(buffTile) ~= "table" or type(buffTile.GetBuffInfo) ~= "function" then
+            return 0, 0
+        end
+        local start, combo = buffTile.GetBuffInfo(name)
+        local tile = type(buffTile.GetBuffTile) == "function" and buffTile.GetBuffTile(name) or nil
+        if tile then
+            start = tonumber(tile.TimerStart) or tonumber(start)
+            combo = tonumber(tile.Combo) or tonumber(combo) or 1
+            defaultDuration = tonumber(tile.TimerDur) or defaultDuration
+        end
+        return tonumber(combo) or 0,
+            start and math.max(0, tonumber(start) + defaultDuration - tonumber(now)) or 0
+    end
+
+    local precisionCombo, precisionRemaining = 0, 0
+    local ok, combo, remaining = pcall(readLive, "Precision", 60)
+    if ok then
+        precisionCombo, precisionRemaining = combo, remaining
+    end
+    local markCount = 0
+    ok, combo = pcall(readLive, "Precise Mark", 30)
+    if ok then
+        markCount = combo
+    end
+    return math.clamp(tonumber(precisionCombo) or 0, 0, 10),
+        math.max(0, tonumber(precisionRemaining) or 0),
+        math.clamp(tonumber(markCount) or 0, 0, 3)
+end
+
+function isPreciseTargetActivated(target)
+    return type(target) == "table"
+        and (target.Touched == true
+            or target.Activated == true
+            or (type(target.Disk) == "table" and target.Disk.Activated == true))
+end
+
+function isGiftedPreciseMarkTarget(target)
+    if type(target) ~= "table" then
+        return false
+    end
+    if target.Mark == true then
+        return true
+    end
+    local color = target.BeamColorInactive
+    return typeof(color) == "Color3"
+        and color.B > 0.7
+        and color.B > color.R * 1.3
+        and color.B > color.G * 1.1
 end
 
 function getBestActivePreciseTarget(fieldName)
@@ -2791,8 +2996,9 @@ function getBestActivePreciseTarget(fieldName)
         return nil
     end
     local now = os.clock()
-    if type(runtime.preciseBeamTargets) == "table" then
-        for _, target in pairs(runtime.preciseBeamTargets) do
+    local liveTargets = getLivePreciseBeamTargets()
+    if type(liveTargets) == "table" then
+        for _, target in pairs(liveTargets) do
             if type(target) == "table" and target.Mine == true then
                 local position = getPreciseTargetPosition(target)
                 if position then
@@ -2800,7 +3006,7 @@ function getBestActivePreciseTarget(fieldName)
                         state.preciseObserved[target] = true
                         state.preciseSeenCount += 1
                     end
-                    if target.Touched == true and not state.preciseTouchedObserved[target] then
+                    if isPreciseTargetActivated(target) and not state.preciseTouchedObserved[target] then
                         state.preciseTouchedObserved[target] = true
                         state.preciseTouchedCount += 1
                     end
@@ -2809,62 +3015,89 @@ function getBestActivePreciseTarget(fieldName)
             end
         end
     end
-    local best, bestPosition, bestPart, bestScore
+    local precisionCombo, precisionRemaining, markCount = getPreciseBuffState()
+    state.precisionCombo = precisionCombo
+    state.precisionRemaining = precisionRemaining
+    state.preciseMarkCount = markCount
+
+    local activeTargets = {}
+    local hasGiftedMarkTarget = false
     for target, seenAt in pairs(state.preciseTargets) do
         local position, part = getPreciseTargetPosition(target)
         local expired = (now - seenAt) > 12
         if type(target) == "table" then
             expired = expired
                 or target.Mine ~= true
-                or target.Touched == true
-                or target.Activated == true
+                or isPreciseTargetActivated(target)
                 or target.IsPurple == true
         end
-        if not position or expired then
+        if not position or expired or not pointIsInsideFarmField(position, fieldName, 8) then
             state.preciseTargets[target] = nil
         else
+            hasGiftedMarkTarget = hasGiftedMarkTarget or isGiftedPreciseMarkTarget(target)
+            table.insert(activeTargets, {
+                target = target,
+                position = position,
+                part = part,
+                seenAt = seenAt
+            })
+        end
+    end
+
+    local markOnly = hasGiftedMarkTarget
+        and (markCount < 3
+            or (precisionCombo >= 10 and precisionRemaining > PRECISION_REFRESH_SECONDS))
+    if not hasGiftedMarkTarget
+        and precisionCombo >= 10
+        and precisionRemaining > PRECISION_REFRESH_SECONDS then
+        state.preciseMode = "precision_healthy"
+        return nil
+    end
+
+    local best, bestPosition, bestPart, bestScore
+    for _, entry in ipairs(activeTargets) do
+        local target = entry.target
+        local giftedMark = isGiftedPreciseMarkTarget(target)
+        if not markOnly or giftedMark then
+            local position = entry.position
             local distance = (rootPart.Position - position).Magnitude
-            local score = 1000 - distance - (now - seenAt) * 20
+            local score = 1000 - distance - (now - entry.seenAt) * 20
+                + (giftedMark and 500 or 0)
             if not bestScore or score > bestScore then
-                best, bestPosition, bestPart, bestScore = target, position, part, score
+                best, bestPosition, bestPart, bestScore = target, position, entry.part, score
             end
         end
     end
-    return best, bestPosition, bestPart
+    state.preciseMode = markOnly and "mark_only" or "build_precision"
+    return best, bestPosition, bestPart, state.preciseMode
 end
 
 function stepAutoPrecise(fieldName)
-    local target, position, part = getBestActivePreciseTarget(fieldName)
+    local target, position, _part, mode = getBestActivePreciseTarget(fieldName)
     if not target or not position then
         return false
     end
     setAutoRbcWalkSpeed(true)
     moveHumanoidToPosition(position)
-    local rootPart = getCharacterRoot()
-    if rootPart and part and firetouchinterest and (rootPart.Position - position).Magnitude <= 4.5 then
-        safeCall(function()
-            firetouchinterest(rootPart, part, 0)
-            firetouchinterest(rootPart, part, 1)
-        end, nil)
-        if type(target) == "table" and runtime.preciseFxModule then
-            safeCall(function()
-                runtime.preciseFxModule.Touch(target)
-            end, nil)
-        end
-    end
     local untouched = 0
-    if type(runtime.preciseBeamTargets) == "table" then
-        for _, beamTarget in pairs(runtime.preciseBeamTargets) do
+    local liveTargets = getLivePreciseBeamTargets()
+    if type(liveTargets) == "table" then
+        for _, beamTarget in pairs(liveTargets) do
             if type(beamTarget) == "table"
                 and beamTarget.Mine == true
-                and beamTarget.Touched ~= true
-                and beamTarget.Activated ~= true then
+                and not isPreciseTargetActivated(beamTarget) then
                 untouched += 1
             end
         end
     end
-    state.detected.status = "Auto Precise | " .. tostring(untouched) .. " marks left in " .. fieldName
-    pushUi()
+    state.detected.status = "Auto Precise " .. tostring(mode or state.preciseMode)
+        .. " | targets " .. tostring(untouched)
+        .. " | Precision x" .. tostring(state.precisionCombo)
+        .. " | Precise Marks x" .. tostring(state.preciseMarkCount)
+    if (os.clock() - state.lastFarmStatusAt) >= 0.15 then
+        state.lastFarmStatusAt = os.clock()
+        pushUi()
+    end
     return true
 end
 
@@ -2912,6 +3145,27 @@ function collectTokensInField(fieldName)
     return tokens
 end
 
+function ensureTokenCollectorListeners()
+    local collectibles = Workspace:FindFirstChild("Collectibles")
+    if not collectibles or runtime.tokenCollectiblesFolder == collectibles then
+        return collectibles
+    end
+    runtime.tokenCollectiblesFolder = collectibles
+    trackConnection(collectibles.ChildAdded:Connect(function(child)
+        if child.Name == "C" then
+            state.tokenQueueDirty = true
+        end
+    end))
+    trackConnection(collectibles.ChildRemoved:Connect(function(child)
+        state.tokenQueueDirty = true
+        if state.activeTokenTarget and state.activeTokenTarget.instance == child then
+            clearActiveTokenTarget(false)
+        end
+    end))
+    state.tokenQueueDirty = true
+    return collectibles
+end
+
 function buildTokenQueue(fieldName, tokens)
     local rootPart = getCharacterRoot()
     if not rootPart then
@@ -2921,7 +3175,7 @@ function buildTokenQueue(fieldName, tokens)
     local remaining = table.clone(tokens or collectTokensInField(fieldName))
     local queue = {}
     local cursor = rootPart.Position
-    while #remaining > 0 and #queue < 10 do
+    while #remaining > 0 and #queue < 24 do
         local bestIndex, bestRouteScore
         for index, token in ipairs(remaining) do
             local legDistance = (cursor - token.position).Magnitude
@@ -2942,7 +3196,7 @@ end
 function clearActiveTokenTarget(failed)
     local target = state.activeTokenTarget
     if failed and target and target.instance then
-        state.tokenFailureUntil[target.instance] = os.clock() + 1.75
+        state.tokenFailureUntil[target.instance] = os.clock() + 0.4
     end
     state.activeTokenTarget = nil
     state.activeTokenStartedAt = 0
@@ -2955,7 +3209,8 @@ function refreshTokenQueue(fieldName, force)
     local now = os.clock()
     if not force
         and state.tokenQueueField == fieldName
-        and (now - state.lastTokenQueueRefreshAt) < 0.35 then
+        and not state.tokenQueueDirty
+        and (now - state.lastTokenQueueRefreshAt) < TOKEN_SCAN_INTERVAL then
         return state.tokenQueue
     end
 
@@ -2963,6 +3218,7 @@ function refreshTokenQueue(fieldName, force)
     state.tokenQueueField = fieldName
     state.tokenQueueBuiltAt = now
     state.lastTokenQueueRefreshAt = now
+    state.tokenQueueDirty = false
     return state.tokenQueue
 end
 
@@ -3069,6 +3325,7 @@ local FARM_PATROL_PATTERN = {
 }
 
 function stepTokenCollectorInField(fieldName)
+    ensureTokenCollectorListeners()
     local now = os.clock()
     local target = state.activeTokenTarget
     if target and not isValidCollectibleToken(target.instance, fieldName) then
@@ -3076,7 +3333,7 @@ function stepTokenCollectorInField(fieldName)
         target = nil
     end
 
-    if target and (now - state.activeTokenStartedAt) > 7 then
+    if target and (now - state.activeTokenStartedAt) > TOKEN_TARGET_TIMEOUT then
         clearActiveTokenTarget(true)
         target = nil
     end
@@ -3095,22 +3352,7 @@ function stepTokenCollectorInField(fieldName)
     target = target or popNextTokenTarget(fieldName)
     if target then
         target.position = target.instance.Position
-        local rootPart = getCharacterRoot()
-        local distance = rootPart and (rootPart.Position - target.position).Magnitude or math.huge
-        if rootPart and distance <= 4.25 then
-            if firetouchinterest then
-                safeCall(function()
-                    firetouchinterest(rootPart, target.instance, 0)
-                    firetouchinterest(rootPart, target.instance, 1)
-                end, nil)
-            end
-            state.tokenFailureUntil[target.instance] = now + 0.5
-            clearActiveTokenTarget(false)
-            refreshTokenQueue(fieldName, true)
-            return true
-        end
-
-        if (now - state.lastTokenRepathAt) >= 0.25 then
+        if (now - state.lastTokenRepathAt) >= TOKEN_REPATH_INTERVAL then
             state.lastTokenRepathAt = now
             state.lastTokenCollectAt = now
             state.lastTokenCollectTarget = tostring(target.instance)
@@ -3118,13 +3360,16 @@ function stepTokenCollectorInField(fieldName)
             moveHumanoidToPosition(target.position)
             recoverFarmMovementIfStalled(target.position)
         end
-        state.detected.status = "Auto farming " .. fieldName .. " | queue "
-            .. tostring(target.tokenName) .. " | " .. tostring(#state.tokenQueue + 1) .. " planned"
-        pushUi()
+        if (now - state.lastFarmStatusAt) >= 0.2 then
+            state.lastFarmStatusAt = now
+            state.detected.status = "Auto farming " .. fieldName .. " | queue "
+                .. tostring(target.tokenName) .. " | " .. tostring(#state.tokenQueue + 1) .. " planned"
+            pushUi()
+        end
         return true
     end
 
-    if (now - state.lastFarmPatrolAt) >= 0.85 then
+    if (now - state.lastFarmPatrolAt) >= 0.35 then
         local targetPosition, _, size = getFarmFieldTargetPosition(fieldName)
         if targetPosition and size then
             state.farmPatrolIndex = (state.farmPatrolIndex % #FARM_PATROL_PATTERN) + 1
@@ -3262,7 +3507,7 @@ function getRbcTaskProfile()
             profile.white = profile.white or target.white == true
             profile.goo = profile.goo or target.goo == true
             profile.convert = profile.convert or target.convert == true
-            profile.defeat = profile.defeat or text:find("defeat", 1, true) ~= nil
+            profile.defeat = profile.defeat or target.defeat == true or text:find("defeat", 1, true) ~= nil
             profile.remaining = math.max(profile.remaining, target.remainingRatio or 1)
             if not target.explicitField
                 and not target.red
@@ -3336,7 +3581,125 @@ function stepSmartRbcMaterials(roundSummary, fieldName)
     return false
 end
 
-function getRbcCombatTarget(currentRound)
+function projectPositionOntoFarmField(position, fieldName, edgePadding)
+    local field = findFarmFieldInstance(fieldName)
+    if not position or not field or not field:IsA("BasePart") then
+        return getFarmFieldTargetPosition(fieldName)
+    end
+    edgePadding = math.max(0, tonumber(edgePadding) or 5)
+    local halfX = math.max(2, field.Size.X * 0.5 - edgePadding)
+    local halfZ = math.max(2, field.Size.Z * 0.5 - edgePadding)
+    local localPosition = field.CFrame:PointToObjectSpace(position)
+    local alignedLocal = Vector3.new(
+        math.clamp(localPosition.X, -halfX, halfX),
+        field.Size.Y * 0.5 + 3.5,
+        math.clamp(localPosition.Z, -halfZ, halfZ)
+    )
+    return field.CFrame:PointToWorldSpace(alignedLocal)
+end
+
+function destroyFieldRecovery()
+    local recovery = runtime.fieldRecovery
+    if not recovery then
+        return
+    end
+    runtime.fieldRecovery = nil
+    if recovery.align then
+        safeCall(function()
+            recovery.align:Destroy()
+        end, nil)
+    end
+    if recovery.attachment then
+        safeCall(function()
+            recovery.attachment:Destroy()
+        end, nil)
+    end
+end
+
+function keepCharacterAlignedToFarmField(fieldName)
+    local field = findFarmFieldInstance(fieldName)
+    local rootPart = getCharacterRoot()
+    if not field or not field:IsA("BasePart") or not rootPart then
+        return false
+    end
+    local localPosition = field.CFrame:PointToObjectSpace(rootPart.Position)
+    local nearField = math.abs(localPosition.X) <= field.Size.X * 0.5 + 14
+        and math.abs(localPosition.Z) <= field.Size.Z * 0.5 + 14
+    if not nearField then
+        return false
+    end
+    local belowSurface = localPosition.Y < field.Size.Y * 0.5 + 0.5
+    local outside = math.abs(localPosition.X) > field.Size.X * 0.5 + 3
+        or math.abs(localPosition.Z) > field.Size.Z * 0.5 + 3
+    if not belowSurface and not outside then
+        if runtime.fieldRecovery then
+            destroyFieldRecovery()
+        end
+        return false
+    end
+
+    local aligned = projectPositionOntoFarmField(rootPart.Position, fieldName, 5)
+    if not aligned then
+        return false
+    end
+
+    if belowSurface and not state.moveInProgress then
+        destroyFieldRecovery()
+        return tweenToFarmField(fieldName)
+    end
+
+    local recovery = runtime.fieldRecovery
+    if not recovery or recovery.rootPart ~= rootPart then
+        destroyFieldRecovery()
+        local attachment = Instance.new("Attachment")
+        attachment.Name = "RBCFieldRecoveryAttachment"
+        attachment.Parent = rootPart
+        local align = Instance.new("AlignPosition")
+        align.Name = "RBCFieldRecoveryAlign"
+        align.Mode = Enum.PositionAlignmentMode.OneAttachment
+        align.Attachment0 = attachment
+        align.ApplyAtCenterOfMass = true
+        align.MaxForce = 1000000000
+        align.MaxVelocity = getTweenVelocity()
+        align.Responsiveness = 160
+        align.RigidityEnabled = false
+        align.Parent = rootPart
+        recovery = {
+            rootPart = rootPart,
+            attachment = attachment,
+            align = align,
+            startedAt = os.clock()
+        }
+        runtime.fieldRecovery = recovery
+    end
+    recovery.align.Position = aligned
+    recovery.align.MaxVelocity = getTweenVelocity()
+
+    if not recovery.monitoring then
+        recovery.monitoring = true
+        task.spawn(function()
+            while isRuntimeActive() and runtime.fieldRecovery == recovery do
+                if not recovery.rootPart.Parent or (os.clock() - recovery.startedAt) > 2 then
+                    break
+                end
+                local localNow = field.CFrame:PointToObjectSpace(recovery.rootPart.Position)
+                local onSurface = localNow.Y >= field.Size.Y * 0.5 + 0.5
+                    and math.abs(localNow.X) <= field.Size.X * 0.5
+                    and math.abs(localNow.Z) <= field.Size.Z * 0.5
+                if onSurface then
+                    break
+                end
+                task.wait(0.03)
+            end
+            if runtime.fieldRecovery == recovery then
+                destroyFieldRecovery()
+            end
+        end)
+    end
+    return true
+end
+
+function getRbcCombatTarget(currentRound, fieldName)
     if not state.smartCombat then
         return nil, 0
     end
@@ -3360,7 +3723,8 @@ function getRbcCombatTarget(currentRound)
                 local distance = rootPart and (rootPart.Position - position).Magnitude or math.huge
                 table.insert(candidates, {
                     instance = monster,
-                    position = position,
+                    position = mechsquito and projectPositionOntoFarmField(position, fieldName, 5) or position,
+                    mechsquito = mechsquito,
                     score = (golden and 500 or 0) + (big and 300 or 0) - distance
                 })
             end
@@ -3372,8 +3736,8 @@ function getRbcCombatTarget(currentRound)
     return candidates[1], relevantCount
 end
 
-function stepRbcCombat(currentRound)
-    local target, targetCount = getRbcCombatTarget(currentRound)
+function stepRbcCombat(currentRound, fieldName)
+    local target, targetCount = getRbcCombatTarget(currentRound, fieldName)
     if not target then
         state.combatTarget = nil
         state.combatTargetStartedAt = 0
@@ -3384,6 +3748,11 @@ function stepRbcCombat(currentRound)
     if not humanoid or not rootPart or humanoid.Health < math.max(30, humanoid.MaxHealth * 0.3) then
         return false
     end
+    if target.mechsquito and keepCharacterAlignedToFarmField(fieldName) then
+        state.detected.status = "Combat field recovery: " .. tostring(fieldName)
+        pushUi()
+        return true
+    end
     if state.combatTarget ~= target.instance then
         state.combatTarget = target.instance
         state.combatTargetStartedAt = os.clock()
@@ -3392,7 +3761,9 @@ function stepRbcCombat(currentRound)
     end
 
     local distance = (rootPart.Position - target.position).Magnitude
-    local movePosition = target.position + Vector3.new(0, 3, 0)
+    local movePosition = target.mechsquito
+        and projectPositionOntoFarmField(target.position, fieldName, 5)
+        or target.position + Vector3.new(0, 3, 0)
     if distance > 11 then
         moveHumanoidToPosition(movePosition)
         recoverFarmMovementIfStalled(movePosition)
@@ -3444,26 +3815,148 @@ function getClaimedHiveTargetPosition()
     return nil
 end
 
+function tweenToHiveForConversion()
+    local targetPosition = getClaimedHiveTargetPosition()
+    local rootPart = getCharacterRoot()
+    if not targetPosition or not rootPart then
+        return false
+    end
+    if state.moveInProgress then
+        return runtime.moveSession and runtime.moveSession.destinationKey == "hive_convert"
+    end
+
+    stopMoveSession()
+    destroyFieldRecovery()
+    local session = {
+        cancelled = false,
+        partCollision = {},
+        destinationKey = "hive_convert",
+        lastHeartbeat = os.clock(),
+        lastProgressAt = os.clock()
+    }
+    session.cleanup = function()
+        cleanupMoveSession(session)
+    end
+    runtime.moveSession = session
+    state.moveInProgress = true
+
+    local humanoid = getCharacterHumanoid()
+    if humanoid then
+        session.humanoid = humanoid
+        session.previousAutoRotate = humanoid.AutoRotate
+        humanoid.AutoRotate = false
+    end
+    local attachment = Instance.new("Attachment")
+    attachment.Name = "RBCHiveMoveAttachment"
+    attachment.Parent = rootPart
+    session.attachment = attachment
+    local align = Instance.new("AlignPosition")
+    align.Name = "RBCHiveMoveAlignPosition"
+    align.Mode = Enum.PositionAlignmentMode.OneAttachment
+    align.Attachment0 = attachment
+    align.Position = targetPosition
+    align.ApplyAtCenterOfMass = true
+    align.MaxForce = 1000000000
+    align.MaxVelocity = getTweenVelocity()
+    align.Responsiveness = 120
+    align.RigidityEnabled = false
+    align.Parent = rootPart
+    session.align = align
+
+    task.spawn(function()
+        local startedAt = os.clock()
+        local timeout = math.clamp((rootPart.Position - targetPosition).Magnitude / math.max(20, align.MaxVelocity) + 3, 5, 25)
+        while isRuntimeActive() and not session.cancelled do
+            if not rootPart.Parent then
+                break
+            end
+            targetPosition = getClaimedHiveTargetPosition()
+            if not targetPosition then
+                break
+            end
+            local moveTarget = getSafeAlignedMoveTarget(session, rootPart.Position, targetPosition)
+            align.Position = moveTarget
+            align.MaxVelocity = getTweenVelocity()
+            setCharacterNoclip(true, session)
+            updateAlignedMoveProgress(session, rootPart, moveTarget)
+            if (rootPart.Position - targetPosition).Magnitude <= 6 then
+                break
+            end
+            if (os.clock() - startedAt) > timeout then
+                break
+            end
+            task.wait(0.04)
+        end
+        cleanupMoveSession(session)
+    end)
+    state.detected.status = "Auto RBC convert: tweening to hive"
+    pushUi()
+    return true
+end
+
+function getRbcConversionPlan()
+    local remaining = 0
+    for _, target in ipairs(getActiveRbcTaskTargets()) do
+        if target.convert and not target.complete then
+            remaining = math.max(remaining, math.max(0, (target.goal or 0) - (target.current or 0)))
+        end
+    end
+    if remaining <= 0 then
+        return nil
+    end
+
+    local stats = safeCall(function()
+        return require(ReplicatedStorage.ClientStatCache).Get()
+    end, nil)
+    local bagPollen = tonumber(stats and stats.Pollen) or 0
+    local fillRatio = getBackpackFillRatioFromGui()
+    local estimatedCapacity = fillRatio > 0.001 and bagPollen / fillRatio or math.huge
+    local bagTarget = math.min(remaining, estimatedCapacity * 0.92)
+    return bagPollen, math.max(1000, bagTarget), remaining
+end
+
 function stepConvertQuestIfNeeded()
-    if getBackpackFillRatioFromGui() < 0.98 then
+    local bagPollen, bagTarget, remaining = getRbcConversionPlan()
+    if not bagPollen then
+        state.convertingAtHive = false
+        state.convertBagTarget = 0
+        return false
+    end
+
+    local hivePosition = getClaimedHiveTargetPosition()
+    local rootPart = getCharacterRoot()
+    local atHive = hivePosition and rootPart and (rootPart.Position - hivePosition).Magnitude <= 8
+
+    if state.convertingAtHive then
+        setCollectorInputHeld(false)
+        if bagPollen <= math.max(250, state.convertBagTarget * 0.02) then
+            state.convertingAtHive = false
+            state.convertBagTarget = 0
+            return false
+        end
+        if atHive then
+            moveHumanoidToPosition(hivePosition)
+            state.detected.status = "Auto RBC converting at hive | " .. tostring(math.floor(tonumber(remaining) or 0)) .. " remaining"
+            pushUi()
+            return true
+        end
+        return tweenToHiveForConversion()
+    end
+
+    if bagPollen < bagTarget * 0.98 then
         return false
     end
 
     local now = os.clock()
-    if (now - state.lastHiveMoveAt) < 2.5 then
+    if (now - state.lastHiveMoveAt) < 0.35 then
         return true
     end
 
-    local hivePosition = getClaimedHiveTargetPosition()
-    if not hivePosition then
-        return false
-    end
-
     state.lastHiveMoveAt = now
-    moveHumanoidToPosition(hivePosition)
-    state.detected.status = "Auto RBC convert: backpack full, moving to hive"
-    pushUi()
-    return true
+    state.convertingAtHive = true
+    state.convertBagTarget = bagTarget
+    setCollectorInputHeld(false)
+    return tweenToHiveForConversion()
 end
 
 function getUprightTweenCFrame(rootPart, targetPosition)
@@ -3472,6 +3965,54 @@ function getUprightTweenCFrame(rootPart, targetPosition)
         return rootPart.CFrame
     end
     return CFrame.lookAt(rootPart.Position, flatTarget)
+end
+
+function getSafeAlignedMoveTarget(session: any, currentPosition: Vector3, finalPosition: Vector3): Vector3
+    if not session or not currentPosition or not finalPosition then
+        return finalPosition
+    end
+
+    if not session.travelPhase then
+        session.travelPhase = "ascend"
+        session.travelHeight = math.max(currentPosition.Y, finalPosition.Y) + TWEEN_TRAVEL_CLEARANCE
+        session.ascentPosition = Vector3.new(currentPosition.X, session.travelHeight, currentPosition.Z)
+        session.lastDistance = nil
+    else
+        session.travelHeight = math.max(
+            session.travelHeight or -math.huge,
+            finalPosition.Y + TWEEN_TRAVEL_CLEARANCE
+        )
+    end
+
+    if session.travelPhase == "ascend" then
+        session.ascentPosition = Vector3.new(
+            session.ascentPosition.X,
+            session.travelHeight,
+            session.ascentPosition.Z
+        )
+        if currentPosition.Y < session.travelHeight - 2 then
+            return session.ascentPosition
+        end
+        session.travelPhase = "horizontal"
+        session.lastDistance = nil
+        session.lastProgressAt = os.clock()
+    end
+
+    local horizontalDistance = Vector3.new(
+        currentPosition.X - finalPosition.X,
+        0,
+        currentPosition.Z - finalPosition.Z
+    ).Magnitude
+    if session.travelPhase == "horizontal" then
+        if horizontalDistance > 3 then
+            return Vector3.new(finalPosition.X, session.travelHeight, finalPosition.Z)
+        end
+        session.travelPhase = "descend"
+        session.lastDistance = nil
+        session.lastProgressAt = os.clock()
+    end
+
+    return finalPosition
 end
 
 function setCharacterNoclip(enabled, session)
@@ -3561,6 +4102,7 @@ function cleanupMoveSession(session)
         pcall(function()
             session.humanoid.AutoRotate = session.previousAutoRotate
         end)
+        session.previousAutoRotate = nil
     end
     if session.align then
         pcall(function()
@@ -3582,8 +4124,8 @@ function cleanupMoveSession(session)
     end
     if runtime.moveSession == session then
         runtime.moveSession = nil
+        state.moveInProgress = false
     end
-    state.moveInProgress = false
 end
 
 function stopMoveSession()
@@ -3592,6 +4134,33 @@ function stopMoveSession()
         session.cancelled = true
         cleanupMoveSession(session)
     end
+end
+
+function updateAlignedMoveProgress(session, rootPart, targetPosition)
+    local now = os.clock()
+    session.lastHeartbeat = now
+    local distance = (rootPart.Position - targetPosition).Magnitude
+    if not session.lastDistance or distance <= session.lastDistance - 1 then
+        session.lastDistance = distance
+        session.lastProgressAt = now
+        return false
+    end
+    if (now - (session.lastProgressAt or now)) < 0.75 then
+        return false
+    end
+
+    session.lastProgressAt = now
+    session.recoveries = (session.recoveries or 0) + 1
+    pcall(function()
+        if session.align and session.align.Parent then
+            session.align.Enabled = false
+            session.align.Position = targetPosition
+            session.align.MaxForce = 1000000000
+            session.align.MaxVelocity = getTweenVelocity()
+            session.align.Enabled = true
+        end
+    end)
+    return true
 end
 
 function tweenToRoboBearCircle()
@@ -3618,7 +4187,10 @@ function tweenToRoboBearCircle()
     local targetPosition = getCircleTargetPosition()
     local session = {
         cancelled = false,
-        partCollision = {}
+        partCollision = {},
+        destinationKey = "robo_bear_circle",
+        lastHeartbeat = os.clock(),
+        lastProgressAt = os.clock()
     }
     session.cleanup = function()
         cleanupMoveSession(session)
@@ -3646,7 +4218,7 @@ function tweenToRoboBearCircle()
     align.Attachment0 = attachment
     align.Position = targetPosition
     align.ApplyAtCenterOfMass = true
-    align.MaxForce = 1000000
+    align.MaxForce = 1000000000
     align.MaxVelocity = getTweenVelocity()
     align.Responsiveness = 120
     align.RigidityEnabled = false
@@ -3674,10 +4246,12 @@ function tweenToRoboBearCircle()
 
             targetPosition = getCircleTargetPosition()
 
-            align.Position = targetPosition
+            local moveTarget = getSafeAlignedMoveTarget(session, rootPart.Position, targetPosition)
+            align.Position = moveTarget
             align.MaxVelocity = getTweenVelocity()
-            orientation.CFrame = getUprightTweenCFrame(rootPart, targetPosition)
+            orientation.CFrame = getUprightTweenCFrame(rootPart, moveTarget)
             setCharacterNoclip(true, session)
+            updateAlignedMoveProgress(session, rootPart, moveTarget)
 
             local horizontalDistance = Vector3.new(rootPart.Position.X - targetPosition.X, 0, rootPart.Position.Z - targetPosition.Z).Magnitude
             if horizontalDistance <= 1.5 and math.abs(rootPart.Position.Y - targetPosition.Y) <= 5 then
@@ -3690,12 +4264,6 @@ function tweenToRoboBearCircle()
         end
 
         cleanupMoveSession(session)
-        if rootPart and rootPart.Parent then
-            pcall(function()
-                rootPart.AssemblyLinearVelocity = Vector3.new()
-                rootPart.AssemblyAngularVelocity = Vector3.new()
-            end)
-        end
         if isRuntimeActive() then
             state.detected.status = session.cancelled and "Tween move cancelled" or "Tween move finished at Robo Bear circle"
             pushUi()
@@ -3732,7 +4300,10 @@ function tweenToFarmField(fieldName)
 
     local session = {
         cancelled = false,
-        partCollision = {}
+        partCollision = {},
+        destinationKey = "field::" .. fieldName,
+        lastHeartbeat = os.clock(),
+        lastProgressAt = os.clock()
     }
     session.cleanup = function()
         cleanupMoveSession(session)
@@ -3760,7 +4331,7 @@ function tweenToFarmField(fieldName)
     align.Attachment0 = attachment
     align.Position = targetPosition
     align.ApplyAtCenterOfMass = true
-    align.MaxForce = 1000000
+    align.MaxForce = 1000000000
     align.MaxVelocity = getTweenVelocity()
     align.Responsiveness = 120
     align.RigidityEnabled = false
@@ -3791,10 +4362,12 @@ function tweenToFarmField(fieldName)
                 break
             end
 
-            align.Position = targetPosition
+            local moveTarget = getSafeAlignedMoveTarget(session, rootPart.Position, targetPosition)
+            align.Position = moveTarget
             align.MaxVelocity = getTweenVelocity()
-            orientation.CFrame = getUprightTweenCFrame(rootPart, targetPosition)
+            orientation.CFrame = getUprightTweenCFrame(rootPart, moveTarget)
             setCharacterNoclip(true, session)
+            updateAlignedMoveProgress(session, rootPart, moveTarget)
 
             if isStandingAtFarmField(fieldName) then
                 break
@@ -3806,12 +4379,6 @@ function tweenToFarmField(fieldName)
         end
 
         cleanupMoveSession(session)
-        if rootPart and rootPart.Parent then
-            pcall(function()
-                rootPart.AssemblyLinearVelocity = Vector3.new()
-                rootPart.AssemblyAngularVelocity = Vector3.new()
-            end)
-        end
         if isRuntimeActive() then
             state.detected.status = session.cancelled and "Field tween cancelled" or ("Tween move finished at " .. fieldName)
             pushUi()
@@ -3998,12 +4565,7 @@ function isNpcDialogOpen()
     for _, descendant in ipairs(getCachedDescendants(npcGui)) do
         if isTextObject(descendant) and isVisibleGuiObject(descendant) then
             local text = compactText(stripRichText(descendant.Text or ""))
-            local lowered = string.lower(text)
-            if text ~= ""
-                and (lowered:find("robo bear", 1, true)
-                    or lowered:find("welcome", 1, true)
-                    or lowered:find("click to continue", 1, true)
-                    or lowered:find("challenge", 1, true)) then
+            if text ~= "" then
                 return true
             end
         end
@@ -4430,7 +4992,8 @@ function clickNpcDialogAction()
                 return clickNpcDialogContinue({ object = fallbackText, position = pos, size = size })
             end
         end
-        return false, "dialog_waiting_for_remote"
+        local pos, size = getGuiBounds(fallbackText)
+        return clickNpcDialogContinue({ object = fallbackText, position = pos, size = size })
     end
 
     return false, "no_remote_dialog_action"
@@ -4565,6 +5128,16 @@ function getCurrentRbcCogs()
             return state.lastSeenLiveCogs
         end
     end
+
+    local stats = safeCall(function()
+        return require(ReplicatedStorage.ClientStatCache).Get()
+    end, nil)
+    local cachedCogs = stats and stats.Eggs and tonumber(stats.Eggs.Cog)
+    if cachedCogs ~= nil then
+        state.lastSeenLiveCogs = cachedCogs
+        return cachedCogs
+    end
+
     return tonumber(state.lastSeenLiveCogs)
 end
 
@@ -4714,6 +5287,72 @@ function findVisibleUpgradeChoices()
             end
         end
         return nil
+    end
+
+    local stats = safeCall(function()
+        return require(ReplicatedStorage.ClientStatCache).Get()
+    end, nil)
+    local challenge = stats
+        and stats.RoboChallenges
+        and stats.RoboChallenges.ActiveChallenge
+    local activeOptions = challenge and challenge.ActiveUpgradeOptions
+    if type(activeOptions) == "table" then
+        for slot = 1, 4 do
+            local option = activeOptions[slot]
+            if type(option) == "table" then
+                local upgradeName = tostring(option[1] or "")
+                local cost = tonumber(option[2])
+                if UPGRADE_BY_NAME[upgradeName] and cost ~= nil then
+                    table.insert(choices, {
+                        upgradeName = upgradeName,
+                        cost = cost,
+                        slot = slot,
+                        y = slot,
+                        x = 0,
+                        source = "ActiveUpgradeOptions"
+                    })
+                end
+            end
+        end
+        -- The server replaces purchased slots with "None" while their GUI
+        -- rows can remain rendered. An empty authoritative list is therefore
+        -- meaningful and must advance to Start Round.
+        return choices
+    end
+
+
+    -- RoboBearGui owns four stable upgrade rows. Reading those rows directly
+    -- avoids guessing costs from nearby labels and keeps low-cog decisions
+    -- synchronized with the same TextCost values shown by the game.
+    local upgradeScreen = boxRoot:FindFirstChild("UpgradeSelectScreen", true)
+    local buttonFrame = upgradeScreen and upgradeScreen:FindFirstChild("ButtonFrame")
+    if upgradeScreen and isVisibleGuiObject(upgradeScreen) and buttonFrame then
+        for slot = 1, 4 do
+            local button = buttonFrame:FindFirstChild("Button" .. tostring(slot))
+            if button and button:IsA("GuiObject") and isVisibleGuiObject(button) then
+                local title = button:FindFirstChild("TextTitle", true)
+                local costLabel = button:FindFirstChild("TextCost", true)
+                local upgradeName = title and isTextObject(title) and extractUpgradeName(title.Text)
+                local costText = costLabel and isTextObject(costLabel) and stripRichText(costLabel.Text) or ""
+                local cost = tonumber(costText:match("Cost:%s*(%d+)"))
+                if upgradeName and cost ~= nil then
+                    table.insert(choices, {
+                        upgradeName = upgradeName,
+                        cost = cost,
+                        slot = slot,
+                        y = safeCall(function()
+                            return button.AbsolutePosition.Y
+                        end, slot),
+                        x = safeCall(function()
+                            return button.AbsolutePosition.X
+                        end, 0)
+                    })
+                end
+            end
+        end
+        if #choices > 0 then
+            return choices
+        end
     end
 
     local function extractUpgradeCostNear(rowY)
@@ -5093,13 +5732,6 @@ function tryAutoRollUpgradePicker(visibleChoices, activeCounts, currentCogs, cur
     if type(visibleChoices) ~= "table" or #visibleChoices == 0 then
         return false, "no_upgrade_choices"
     end
-    if state.lastUpgradeBoughtRound ~= currentRound then
-        return false, "wait_for_upgrade_purchase"
-    end
-    if state.lastUpgradeRerollRound == currentRound then
-        return false, "round_reroll_limit"
-    end
-
     local now = os.clock()
     if (now - state.lastUpgradeChoicesSeenAt) < state.actionDelay then
         return false, "waiting_for_upgrade_picker"
@@ -5110,6 +5742,27 @@ function tryAutoRollUpgradePicker(visibleChoices, activeCounts, currentCogs, cur
         return false, "affordable_upgrade_available"
     end
 
+    -- A round with no affordable first purchase must advance immediately.
+    -- Rerolls are only useful after this round has successfully bought an
+    -- upgrade; otherwise the previous gate left low-cog runs stuck forever.
+    if state.lastUpgradeBoughtRound ~= currentRound then
+        return tryRoboBearRoundStartAfterUpgrades(
+            visibleChoices,
+            activeCounts,
+            currentCogs,
+            currentRound
+        )
+    end
+
+    if state.lastUpgradeRerollRound == currentRound then
+        return tryRoboBearRoundStartAfterUpgrades(
+            visibleChoices,
+            activeCounts,
+            currentCogs,
+            currentRound
+        )
+    end
+
     local whitelistedChoice = chooseUpgradeChoice(visibleChoices, activeCounts, currentCogs, currentRound, false)
     local rerollSignature = table.concat({
         tostring(currentRound),
@@ -5118,7 +5771,7 @@ function tryAutoRollUpgradePicker(visibleChoices, activeCounts, currentCogs, cur
     }, "::")
 
     if currentCogs >= AUTO_ROLL_MIN_COGS then
-        if (now - state.lastUpgradeRerollAt) >= 0.9 and state.lastUpgradeRerollSignature ~= rerollSignature and fireRoboBearReroll() then
+        if (now - state.lastUpgradeRerollAt) >= 0.35 and state.lastUpgradeRerollSignature ~= rerollSignature and fireRoboBearReroll() then
             if rerollSignature ~= state.lastUpgradeRerollHistorySignature then
                 pushHistory(state.upgradePickHistory, table.concat({
                     "[" .. os.date("%X") .. "] Round " .. tostring(currentRound),
@@ -5144,7 +5797,7 @@ function tryAutoRollUpgradePicker(visibleChoices, activeCounts, currentCogs, cur
         if lockableChoice then
             local lockSignature = buildUpgradeLockSignature(lockableChoice, activeCounts, currentCogs, currentRound)
             if lockSignature ~= state.lastUpgradeLockSignature
-                and (now - state.lastUpgradeLockAttemptAt) >= 0.75
+                and (now - state.lastUpgradeLockAttemptAt) >= 0.35
                 and fireRoboBearUpgradeLock(lockableChoice.slot, true) then
                 if lockSignature ~= state.lastUpgradeLockHistorySignature then
                     pushHistory(state.upgradePickHistory, table.concat({
@@ -5182,12 +5835,12 @@ function tryRoboBearRoundStartAfterUpgrades(visibleChoices, activeCounts, curren
     end
 
     local now = os.clock()
-    if (now - state.lastUpgradeChoicesSeenAt) < (state.actionDelay + 0.6) then
+    if (now - state.lastUpgradeChoicesSeenAt) < (state.actionDelay + 0.08) then
         return false, "waiting_for_upgrade_picker"
     end
 
     local lastUpgradeActionAt = math.max(state.lastUpgradePickAttemptAt or 0, state.lastUpgradeLockAttemptAt or 0)
-    if lastUpgradeActionAt > 0 and (now - lastUpgradeActionAt) < 1.35 then
+    if lastUpgradeActionAt > 0 and (now - lastUpgradeActionAt) < 0.38 then
         return false, "waiting_for_upgrade_action"
     end
 
@@ -5202,7 +5855,7 @@ function tryRoboBearRoundStartAfterUpgrades(visibleChoices, activeCounts, curren
         formatUpgradeChoicesForHistory(visibleChoices)
     }, "::")
 
-    if startSignature == state.lastRoboBearRoundStartSignature and (now - state.lastRoboBearRoundStartAt) < 4 then
+    if startSignature == state.lastRoboBearRoundStartSignature and (now - state.lastRoboBearRoundStartAt) < 1 then
         return false, "recent_round_start"
     end
 
@@ -5717,7 +6370,7 @@ sub.Font = Enum.Font.Gotham
 sub.TextColor3 = Color3.fromRGB(210, 210, 210)
 sub.TextXAlignment = Enum.TextXAlignment.Left
 sub.TextSize = 12
-sub.Text = "Built-in UI only. Overlap execute replaces the previous run. Press RightControl to show or hide."
+sub.Text = "Built-in UI only. Overlap execute replaces the previous run. Press RightShift to show or hide."
 sub.ZIndex = 101
 sub.Parent = root
 
@@ -7271,10 +7924,26 @@ function updateControlTabUi()
     buttons.settingsTab.BackgroundColor3 = state.controlTab == "settings" and Color3.fromRGB(76, 52, 76) or Color3.fromRGB(43, 33, 43)
 end
 
-function pushUi()
+function pushUi(force)
     if not isRuntimeActive() then
         return
     end
+
+    local now = os.clock()
+    if not force and (now - (runtime.lastUiPushAt or 0)) < 0.08 then
+        if not runtime.uiPushQueued then
+            runtime.uiPushQueued = true
+            task.delay(0.08, function()
+                if isRuntimeActive() then
+                    runtime.uiPushQueued = false
+                    pushUi(true)
+                end
+            end)
+        end
+        return
+    end
+    runtime.lastUiPushAt = now
+    runtime.uiPushQueued = false
 
     buttons.auto.Text = state.autoScan and "Auto: ON" or "Auto: OFF"
     buttons.interact.Text = state.autoRoboBearInteract and "Robo E: ON" or "Robo E: OFF"
@@ -7329,11 +7998,6 @@ function refreshDetection()
 
     state.refreshInProgress = true
     resetGuiCache()
-    if not root.Visible then
-        state.refreshInProgress = false
-        return
-    end
-
     local guiData = scanGuiForQuestData()
     local guiCandidate = guiData and guiData.best or nil
     local visibleBeeChoices = findVisibleBeeChoices()
@@ -7556,7 +8220,7 @@ function refreshDetection()
             local signature = choiceSignature .. "::" .. bestChoice.beeName .. "::" .. tostring(bestChoice.slot)
             state.detected.pickedBee = bestChoice.beeName .. " (" .. tostring(bestChoice.slot) .. ")"
             if state.beePickCount < 4
-                and (now - state.lastBeePickAt) >= 0.85
+                and (now - state.lastBeePickAt) >= AUTOMATION_UI_SETTLE
                 and (now - state.lastBeeChoicesSeenAt) >= state.actionDelay
                 and bestChoice.slot then
                 if fireRoboBearBeeSelect(bestChoice.slot) then
@@ -7629,7 +8293,7 @@ function refreshDetection()
                 local lockSignature = buildUpgradeLockSignature(lockableUpgradeChoice, activeUpgradeCounts, currentCogs, currentRound)
                 local now = os.clock()
                 if lockSignature ~= state.lastUpgradeLockSignature
-                    and (now - state.lastUpgradeLockAttemptAt) >= 0.75
+                    and (now - state.lastUpgradeLockAttemptAt) >= 0.35
                     and (now - state.lastUpgradeChoicesSeenAt) >= state.actionDelay
                     and fireRoboBearUpgradeLock(lockableUpgradeChoice.slot, true) then
                     if lockSignature ~= state.lastUpgradeLockHistorySignature then
@@ -7659,7 +8323,7 @@ function refreshDetection()
 
             local now = os.clock()
             local sameUpgradeAttempt = signature == state.lastUpgradePickSignature
-            local retryDelay = sameUpgradeAttempt and 2.5 or 0.75
+            local retryDelay = sameUpgradeAttempt and 0.8 or 0.35
             if affordable
                 and (now - state.lastUpgradePickAttemptAt) >= retryDelay
                 and (now - state.lastUpgradeChoicesSeenAt) >= state.actionDelay
@@ -7722,6 +8386,57 @@ function refreshDetection()
     end
 end
 
+function installRbcUiWakeListeners()
+    if runtime.rbcUiWakeInstalled then
+        return
+    end
+    runtime.rbcUiWakeInstalled = true
+
+    local function wake()
+        if not isRuntimeActive() or not state.autoScan then
+            return
+        end
+        if state.refreshInProgress then
+            state.refreshQueued = true
+        else
+            task.defer(refreshDetection)
+        end
+    end
+
+    local watched = setmetatable({}, { __mode = "k" })
+    local function watchGui(guiObject)
+        if not guiObject or watched[guiObject] or not guiObject:IsA("GuiObject") then
+            return
+        end
+        watched[guiObject] = true
+        trackConnection(guiObject:GetPropertyChangedSignal("Visible"):Connect(function()
+            if guiObject.Visible then
+                wake()
+            end
+        end))
+    end
+
+    local prompt = getRoboBearPromptRoot()
+    if prompt then
+        watchGui(prompt)
+        for _, descendant in ipairs(prompt:GetDescendants()) do
+            if descendant.Name == "QuestSelectScreen"
+                or descendant.Name == "BeeSelectScreen"
+                or descendant.Name == "UpgradeSelectScreen"
+                or descendant.Name == "StartRoundButton" then
+                watchGui(descendant)
+            end
+        end
+        trackConnection(prompt.DescendantAdded:Connect(function(descendant)
+            watchGui(descendant)
+            wake()
+        end))
+    end
+
+    local npcGui = getNpcDialogGui()
+    watchGui(npcGui)
+end
+
 buttons.refresh.MouseButton1Click:Connect(function()
     refreshDetection()
 end)
@@ -7758,6 +8473,8 @@ function setAutoRbc(enabled)
     else
         setCollectorInputHeld(false)
         setAutoRbcWalkSpeed(false)
+        stopMoveSession()
+        destroyFieldRecovery()
         clearActiveTokenTarget(false)
         state.detected.status = "Auto RBC disabled"
     end
@@ -8065,7 +8782,7 @@ trackConnection(UserInputService.InputBegan:Connect(function(input, processed)
     if not isRuntimeActive() then
         return
     end
-    if input.KeyCode == Enum.KeyCode.RightControl then
+    if input.KeyCode == Enum.KeyCode.RightShift then
         state.minimized = not state.minimized
         root.Visible = not state.minimized
     end
@@ -8105,7 +8822,7 @@ function runAutoScanLoop()
             if state.autoScan then
                 local waitTime = state.scanInterval
                 if state.autoBeePick or state.autoUpgradePick then
-                    waitTime = 0.5
+                    waitTime = 0.1
                 end
                 task.wait(waitTime)
                 if state.autoScan and not state.refreshInProgress then
@@ -8126,7 +8843,7 @@ function stepRoboBearDialog()
         state.detected.status = "Robo Bear round running; Robo E paused"
             .. ((roundSummary and roundSummary.round > 0) and (" | round " .. tostring(roundSummary.round)) or "")
         pushUi()
-        task.wait(0.4)
+        task.wait(0.08)
         return
     end
     if isNpcDialogShowingRoundInProgress() then
@@ -8134,20 +8851,20 @@ function stepRoboBearDialog()
         clearChallengeInfoWait()
         state.detected.status = "Dismissed stale round dialogue"
         pushUi()
-        task.wait(0.3)
+        task.wait(0.08)
         return
     end
 
     if not isNpcDialogOpen() and isRoboBearChallengePromptOpen() then
         state.detected.status = "RoboBearPrompt open; Robo E waiting"
         pushUi()
-        task.wait(0.4)
+        task.wait(0.08)
         return
     end
 
     local now = os.clock()
-    if (now - state.lastNpcDialogClickAt) < 0.55 then
-        task.wait(0.08)
+    if (now - state.lastNpcDialogClickAt) < DIALOG_INPUT_INTERVAL then
+        task.wait(0.02)
         return
     end
 
@@ -8160,7 +8877,7 @@ function stepRoboBearDialog()
         state.detected.status = "NPC dialog remote idle: " .. tostring(action)
         pushUi()
     end
-    task.wait(0.18)
+    task.wait(0.03)
 end
 
 function stepRoboBearInteract()
@@ -8171,7 +8888,7 @@ function stepRoboBearInteract()
         state.detected.status = "Robo Bear round running; Robo E paused"
             .. ((roundSummary and roundSummary.round > 0) and (" | round " .. tostring(roundSummary.round)) or "")
         pushUi()
-        task.wait(0.4)
+        task.wait(0.08)
         return
     end
     if runtime.npcDialogForcedHidden then
@@ -8186,7 +8903,7 @@ function stepRoboBearInteract()
         clearChallengeInfoWait()
         state.detected.status = "Dismissed stale round dialogue"
         pushUi()
-        task.wait(0.3)
+        task.wait(0.08)
         return
     end
 
@@ -8198,7 +8915,7 @@ function stepRoboBearInteract()
             state.pendingPostGameOverCancel = true
             state.detected.status = "Game Over rewards claimed"
             pushUi()
-            task.wait(0.75)
+            task.wait(0.1)
             return
         end
         if state.pendingPostGameOverCancel then
@@ -8210,12 +8927,18 @@ function stepRoboBearInteract()
                     break
                 end
             end
-            if cancelled then
+            if not cancelled then
+                cancelled = invokeNpcTextBoxClick()
+            end
+            if not cancelled and (os.clock() - state.lastRoboBearClaimAt) >= 0.35 then
+                cancelled = dismissNpcDialogDuringRound()
+            end
+            if cancelled or (os.clock() - state.lastRoboBearClaimAt) >= 0.75 then
                 state.pendingPostGameOverCancel = false
                 state.detected.status = "Closed stale Game Over dialogue"
                 pushUi()
             end
-            task.wait(0.55)
+            task.wait(0.06)
             return
         end
         stepRoboBearDialog()
@@ -8224,45 +8947,55 @@ function stepRoboBearInteract()
 
     if isLiveRoboBearChallengeUiVisible() then
         local now = os.clock()
-        if (now - state.lastRoboBearClaimAt) >= 1.5
+        if (now - state.lastRoboBearClaimAt) >= 0.35
             and clickVisibleRoboBearClaimRewardsButton() then
             state.lastRoboBearClaimAt = now
             state.pendingPostGameOverCancel = true
             state.detected.status = "Game Over rewards claimed"
             pushUi()
-            task.wait(0.75)
+            task.wait(0.1)
             return
         end
         if isRoboBearChallengePromptOpen() then
-            if (now - state.lastRoboBearRoundStartAt) >= 1.5 then
+            local visibleUpgradeChoices = findVisibleUpgradeChoices()
+            if #visibleUpgradeChoices > 0 then
+                local startedRound = tryRoboBearRoundStartFromCurrentUpgradePrompt()
+                state.detected.status = startedRound
+                    and "Robo Bear round started after upgrade automation"
+                    or "Waiting for upgrade automation to settle"
+                pushUi()
+                task.wait(0.03)
+                return
+            end
+            if (now - state.lastRoboBearRoundStartAt) >= 0.35 then
                 local started, action = clickVisibleRoboBearStartRoundButton()
                 state.lastRoboBearRoundStartAt = now
                 state.detected.status = started
                     and ("Robo Bear round start: " .. tostring(action))
                     or ("Robo Bear start waiting: " .. tostring(action))
                 pushUi()
-                task.wait(started and 0.55 or 0.35)
+                task.wait(started and 0.1 or 0.06)
                 return
             end
         end
         clearChallengeInfoWait()
         state.detected.status = "Live RoboBearPrompt visible; Robo E paused"
         pushUi()
-        task.wait(0.4)
+        task.wait(0.08)
         return
     end
 
     if isWaitingForChallengeInfo() then
         state.detected.status = "Waiting for live RoboBearPrompt after RoboBearRoundStart"
         pushUi()
-        task.wait(0.25)
+        task.wait(0.05)
         return
     end
 
     if not isStandingAtRoboBearCircle() then
         state.detected.status = "Robo E waiting at Robo Bear circle"
         pushUi()
-        task.wait(0.25)
+        task.wait(0.05)
         return
     end
 
@@ -8271,20 +9004,20 @@ function stepRoboBearInteract()
         local startedRound = tryRoboBearRoundStartFromCurrentUpgradePrompt()
         if startedRound then
             pushUi()
-            task.wait(0.4)
+            task.wait(0.08)
             return
         end
 
         state.detected.status = "RoboBearPrompt open; Robo E waiting"
             .. (roundEndSummary.ended and (" | round " .. tostring(roundEndSummary.round) .. " ended") or "")
         pushUi()
-        task.wait(0.4)
+        task.wait(0.08)
         return
     end
 
     local now = os.clock()
-    if (now - state.lastRoboBearEAt) < 0.35 then
-        task.wait(0.1)
+    if (now - state.lastRoboBearEAt) < 0.12 then
+        task.wait(0.02)
         return
     end
 
@@ -8296,25 +9029,165 @@ function stepRoboBearInteract()
         .. (promptVisible and " | talk prompt" or "")
         .. (inCircle and " | circle" or "")
     pushUi()
-    task.wait(fired and 0.45 or 0.35)
+    task.wait(fired and 0.1 or 0.06)
 end
 
-local RBC_FIELD_COLOR_CAPABILITIES = {
-    ["Sunflower Field"] = { red = 0.35, white = 1.0 },
-    ["Dandelion Field"] = { white = 1.0 },
-    ["Mushroom Field"] = { red = 0.8, white = 0.45 },
-    ["Blue Flower Field"] = { blue = 1.0, white = 0.35 },
-    ["Clover Field"] = { red = 0.15, blue = 0.7, white = 0.25 },
-    ["Strawberry Field"] = { red = 1.0, white = 0.35 },
-    ["Spider Field"] = { white = 1.0 },
-    ["Bamboo Field"] = { blue = 1.0, white = 0.3 },
-    ["Pineapple Patch"] = { white = 1.0 },
-    ["Cactus Field"] = { red = 0.15, blue = 0.85, white = 0.1 },
-    ["Pumpkin Patch"] = { white = 1.0, blue = 0.4, red = 0.1 },
-    ["Pine Tree Forest"] = { blue = 1.0, white = 0.1 },
-    ["Rose Field"] = { red = 1.0, white = 0.35 },
-    ["Mountain Top Field"] = { red = 0.05, blue = 1.0 }
+-- Weighted flower yields measured from the live game's flower textures. A tier
+-- 1/2/3/4 flower contributes 1/2/3/4 here, so both color mix and field quality
+-- affect routing instead of relying on broad wiki-style color labels.
+local RBC_FIELD_POLLEN_YIELD = {
+    ["Sunflower Field"] = { red = 111, blue = 100, white = 497, total = 708 },
+    ["Dandelion Field"] = { red = 35, blue = 88, white = 636, total = 759 },
+    ["Mushroom Field"] = { red = 573, blue = 0, white = 236, total = 809 },
+    ["Blue Flower Field"] = { red = 0, blue = 554, white = 232, total = 786 },
+    ["Clover Field"] = { red = 400, blue = 360, white = 387, total = 1147 },
+    ["Strawberry Field"] = { red = 780, blue = 0, white = 277, total = 1057 },
+    ["Spider Field"] = { red = 0, blue = 0, white = 1461, total = 1461 },
+    ["Bamboo Field"] = { red = 0, blue = 971, white = 323, total = 1294 },
+    ["Pineapple Patch"] = { red = 81, blue = 83, white = 1439, total = 1603 },
+    ["Cactus Field"] = { red = 703, blue = 692, white = 101, total = 1496 },
+    ["Pumpkin Patch"] = { red = 301, blue = 274, white = 938, total = 1513 },
+    ["Pine Tree Forest"] = { red = 0, blue = 1492, white = 254, total = 1746 },
+    ["Rose Field"] = { red = 1444, blue = 0, white = 223, total = 1667 },
+    ["Mountain Top Field"] = { red = 1050, blue = 966, white = 0, total = 2016 },
+    ["Ant Field"] = { red = 152, blue = 144, white = 76, total = 372 },
+    ["Stump Field"] = { red = 96, blue = 1293, white = 300, total = 1689 },
+    ["Coconut Field"] = { red = 165, blue = 54, white = 1671, total = 1890 },
+    ["Pepper Patch"] = { red = 1448, blue = 0, white = 259, total = 1707 }
 }
+
+local RBC_FIELD_UPGRADE_GROUPS = {
+    Homepage = {
+        base = 1.25, cap = 3.5,
+        fields = { ["Sunflower Field"] = true, ["Dandelion Field"] = true, ["Mushroom Field"] = true, ["Blue Flower Field"] = true }
+    },
+    Router = {
+        base = 1.3, cap = 4,
+        fields = { ["Strawberry Field"] = true, ["Spider Field"] = true, ["Bamboo Field"] = true, ["Pineapple Patch"] = true }
+    },
+    ["Base-15"] = {
+        base = 1.25, cap = 3.5,
+        fields = { ["Cactus Field"] = true, ["Pumpkin Patch"] = true, ["Pine Tree Forest"] = true, ["Rose Field"] = true }
+    },
+    Wifi = {
+        base = 1.5, cap = 6,
+        fields = { ["Stump Field"] = true, ["Mountain Top Field"] = true, ["Coconut Field"] = true, ["Pepper Patch"] = true }
+    }
+}
+
+function getRbcFieldPollenMultiplier(fieldName, activeUpgrades)
+    local multiplier = 1
+    for upgradeName, group in pairs(RBC_FIELD_UPGRADE_GROUPS) do
+        local level = tonumber(activeUpgrades[upgradeName]) or 0
+        if level > 0 and group.fields[fieldName] then
+            local alpha = math.clamp((level - 1) / 9, 0, 1)
+            multiplier *= group.base + (group.cap - group.base) * alpha
+        end
+    end
+    return multiplier
+end
+
+function isCoconutCrabAlive()
+    local nowClock = os.clock()
+    if (nowClock - state.lastCoconutCrabCheckAt) < 0.5 then
+        return state.coconutCrabAlive
+    end
+    state.lastCoconutCrabCheckAt = nowClock
+
+    local stats = safeCall(function()
+        return require(ReplicatedStorage.ClientStatCache).Get()
+    end, nil)
+    local lastDefeat = stats and stats.MonsterTimes and tonumber(stats.MonsterTimes.CoconutCrab)
+    local spawner = Workspace:FindFirstChild("MonsterSpawners")
+        and Workspace.MonsterSpawners:FindFirstChild("CoconutCrab")
+    local cooldownValue = spawner and spawner:FindFirstChild("Cooldown")
+    local cooldown = cooldownValue and tonumber(cooldownValue.Value) or 300
+    local serverNow = safeCall(function()
+        return require(ReplicatedStorage.OsTime)()
+    end, os.time())
+
+    -- MonsterTimes stores the last defeat timestamp. Once the spawner cooldown
+    -- has elapsed, entering Coconut Field can spawn the crab even if no model is
+    -- currently replicated outside its territory.
+    state.coconutCrabAlive = not lastDefeat or (tonumber(serverNow) - lastDefeat) >= cooldown
+    return state.coconutCrabAlive
+end
+
+function applyRbcFieldHazardScore(fieldName, score, pureGenericWhite)
+    if not pureGenericWhite or not isCoconutCrabAlive() then
+        return score
+    end
+    if fieldName == "Coconut Field" then
+        return score - 100000
+    end
+    if fieldName == "Spider Field" then
+        return score + 100000
+    end
+    return score
+end
+
+function estimateQuestCompletionCost(quest)
+    local taskTexts = {}
+    if type(quest) == "table" and type(quest.tasks) == "table" then
+        for _, taskText in ipairs(quest.tasks) do
+            table.insert(taskTexts, tostring(taskText))
+        end
+    end
+    if #taskTexts == 0 and type(quest) == "table" then
+        for taskText in tostring(quest.objective or ""):gmatch("[^|]+") do
+            table.insert(taskTexts, taskText)
+        end
+    end
+
+    local activeUpgrades = getActiveUpgradeCounts()
+    local totalCost = 0
+    for _, taskText in ipairs(taskTexts) do
+        local lowered = string.lower(taskText)
+        local amountText = taskText:match("[Cc]ollect%s+([%d,]+)")
+            or taskText:match("[Mm]ake%s+([%d,]+)")
+            or taskText:match("[Cc]onvert%s+([%d,]+)")
+        local amount = amountText and tonumber((amountText:gsub(",", ""))) or 0
+        local target = inferRbcTaskTargetFromText(taskText)
+        if target and amount > 0 then
+            local bestYield = 0
+            local coconutUnsafe = target.white and not target.explicitField and isCoconutCrabAlive()
+            for fieldName, yields in pairs(RBC_FIELD_POLLEN_YIELD) do
+                if (not coconutUnsafe or fieldName ~= "Coconut Field")
+                    and (not target.explicitField or rbcFieldMatchesExplicitTarget(fieldName, target)) then
+                    local multiplier = getRbcFieldPollenMultiplier(fieldName, activeUpgrades)
+                    local fieldYield
+                    if target.red then
+                        fieldYield = yields.red
+                    elseif target.blue then
+                        fieldYield = yields.blue
+                    elseif target.white then
+                        fieldYield = yields.white
+                    else
+                        fieldYield = yields.total
+                    end
+                    bestYield = math.max(bestYield, (fieldYield or 0) * multiplier)
+                end
+            end
+            local taskCost = amount / math.max(1, bestYield)
+            if target.goo then
+                taskCost *= 1.25
+            end
+            if target.convert then
+                taskCost *= 1.15
+            end
+            totalCost += taskCost
+        elseif lowered:find("defeat", 1, true) or lowered:find("monster", 1, true) then
+            local monsterCount = tonumber(((taskText:match("([%d,]+)") or "1"):gsub(",", ""))) or 1
+            totalCost += monsterCount * 18
+        else
+            totalCost += 250
+        end
+    end
+
+    local rewardText = type(quest) == "table" and tostring(quest.reward or "") or ""
+    local rewardCogs = tonumber(rewardText:match("(%d+)%s*[Cc]ogs")) or 0
+    return totalCost - rewardCogs * 1.5
+end
 
 function rbcFieldMatchesExplicitTarget(fieldName, target)
     for _, targetField in ipairs(target.fields or EMPTY_TABLE) do
@@ -8325,15 +9198,23 @@ function rbcFieldMatchesExplicitTarget(fieldName, target)
     return false
 end
 
-function scoreRbcFieldForTargets(fieldName, targets)
-    local capabilities = RBC_FIELD_COLOR_CAPABILITIES[fieldName] or {}
+function scoreRbcFieldForTargets(fieldName, targets, activeUpgrades)
+    local yields = RBC_FIELD_POLLEN_YIELD[fieldName] or { red = 0, blue = 0, white = 0, total = 0 }
+    activeUpgrades = activeUpgrades or getActiveUpgradeCounts()
+    local fieldMultiplier = getRbcFieldPollenMultiplier(fieldName, activeUpgrades)
     local score = 0
     local mode = "field"
+    local requestedRemaining = { red = 0, blue = 0, white = 0 }
+    local hasGenericPollen = false
 
     for _, target in ipairs(targets) do
         if not target.complete then
             local remaining = math.max(0.15, target.remainingRatio or 1)
-            if target.explicitField then
+            if target.defeat then
+                -- Combat routing is handled by stepRbcCombat; do not mistake a
+                -- monster objective for generic pollen.
+                score += 0
+            elseif target.explicitField then
                 if rbcFieldMatchesExplicitTarget(fieldName, target) then
                     score += 520 * remaining
                 else
@@ -8343,30 +9224,22 @@ function scoreRbcFieldForTargets(fieldName, targets)
                     score -= 650 * remaining
                 end
             else
-                local matchedColors = 0
-                local colorEfficiency = 0
-                if target.red and (capabilities.red or 0) > 0 then
-                    matchedColors += 1
-                    colorEfficiency += capabilities.red
-                end
-                if target.blue and (capabilities.blue or 0) > 0 then
-                    matchedColors += 1
-                    colorEfficiency += capabilities.blue
-                end
-                if target.white and (capabilities.white or 0) > 0 then
-                    matchedColors += 1
-                    colorEfficiency += capabilities.white
-                end
                 local requestedColors = (target.red and 1 or 0)
                     + (target.blue and 1 or 0)
                     + (target.white and 1 or 0)
                 if requestedColors > 0 then
-                    score += colorEfficiency * 150 * remaining
-                    if matchedColors == requestedColors then
-                        score += 100 * remaining
+                    for _, color in ipairs({ "red", "blue", "white" }) do
+                        if target[color] then
+                            requestedRemaining[color] = math.max(requestedRemaining[color], remaining)
+                            score += (yields[color] or 0) * fieldMultiplier * remaining * 0.1
+                            if (yields[color] or 0) <= 0 then
+                                score -= 350 * remaining
+                            end
+                        end
                     end
                 else
-                    score += 45 * remaining
+                    hasGenericPollen = not target.convert
+                    score += (yields.total or 0) * fieldMultiplier * remaining * 0.1
                 end
                 if target.goo then
                     score += 70 * remaining
@@ -8379,33 +9252,68 @@ function scoreRbcFieldForTargets(fieldName, targets)
         end
     end
 
-    if fieldName == state.currentRbcQuestField then
-        score += 22
+    local requestedValues = {}
+    for _, color in ipairs({ "red", "blue", "white" }) do
+        if requestedRemaining[color] > 0 then
+            table.insert(requestedValues, math.max(1,
+                (yields[color] or 0) * fieldMultiplier / math.max(0.15, requestedRemaining[color])))
+        end
+    end
+    if #requestedValues > 1 then
+        local reciprocalSum = 0
+        local minimumValue = math.huge
+        for _, value in ipairs(requestedValues) do
+            reciprocalSum += 1 / value
+            minimumValue = math.min(minimumValue, value)
+        end
+        score += minimumValue * 2 + (#requestedValues / reciprocalSum) * 0.15
+    elseif #requestedValues == 0 and hasGenericPollen then
+        score += (yields.total or 0) * fieldMultiplier * 0.04
     end
 
-    local activeUpgrades = getActiveUpgradeCounts()
-    local homepage = activeUpgrades["Homepage"] or 0
-    if homepage > 0 and (fieldName == "Mushroom Field"
-        or fieldName == "Dandelion Field"
-        or fieldName == "Sunflower Field"
-        or fieldName == "Blue Flower Field") then
-        score += homepage * 120
+    if fieldName == state.currentRbcQuestField then
+        score += 0.25
     end
 
     local rootPart = getCharacterRoot()
     local targetPosition = getFarmFieldTargetPosition(fieldName)
     if rootPart and targetPosition then
-        score -= math.min(90, (rootPart.Position - targetPosition).Magnitude * 0.055)
+        score -= math.min(0.2, (rootPart.Position - targetPosition).Magnitude * 0.0002)
     end
     return score, mode
 end
 
 function getAutoRbcTargetField()
-    local targets = getVisibleRbcTaskTargets()
+    local allTargets = getVisibleRbcTaskTargets()
+    local targets = {}
+    local primaryTaskKey = ""
+    for index, target in ipairs(allTargets) do
+        if not target.complete and not target.defeat then
+            table.insert(targets, target)
+            primaryTaskKey = table.concat({
+                tostring(target.source or "Gui"),
+                tostring(index),
+                normalizeFieldText(target.text)
+            }, "::")
+            break
+        end
+    end
+    if #targets == 0 then
+        targets = allTargets
+        primaryTaskKey = "combat_or_fallback"
+    end
+    state.activeRbcTaskKey = primaryTaskKey
     local candidateFields = {}
-    local hasRed, hasBlue, hasWhite, hasGeneric = false, false, false, false
+    local taskSignatureParts = {}
+    local hasWhitePollen = false
+    local hasOtherColorPollen = false
+    local hasExplicitPollenField = false
     for _, target in ipairs(targets) do
         if not target.complete then
+            table.insert(taskSignatureParts, (normalizeFieldText(target.text)))
+            hasWhitePollen = hasWhitePollen or target.white == true
+            hasOtherColorPollen = hasOtherColorPollen or target.red == true or target.blue == true
+            hasExplicitPollenField = hasExplicitPollenField or target.explicitField == true
             if isValidFarmField(target.fieldName) then
                 candidateFields[target.fieldName] = true
             end
@@ -8414,54 +9322,39 @@ function getAutoRbcTargetField()
                     candidateFields[fieldName] = true
                 end
             end
-            hasRed = hasRed or target.red
-            hasBlue = hasBlue or target.blue
-            hasWhite = hasWhite or target.white
-            hasGeneric = hasGeneric or (not target.explicitField
-                and not target.red
-                and not target.blue
-                and not target.white
-                and not target.convert)
         end
     end
 
-    if hasRed and hasWhite then
-        candidateFields["Sunflower Field"] = true
-    end
-    if hasBlue and hasWhite then
-        candidateFields["Blue Flower Field"] = true
-    end
-    if hasRed then
-        candidateFields["Rose Field"] = true
-    end
-    if hasBlue then
-        candidateFields["Blue Flower Field"] = true
-    end
-    if hasWhite then
-        candidateFields["Dandelion Field"] = true
-    end
-    if hasGeneric or hasRed then
-        candidateFields["Strawberry Field"] = true
-        candidateFields["Mushroom Field"] = true
+    for fieldName in pairs(RBC_FIELD_POLLEN_YIELD) do
+        if isValidFarmField(fieldName) then
+            candidateFields[fieldName] = true
+        end
     end
     candidateFields[getRouteDefaultFarmField()] = true
     if isValidFarmField(state.currentRbcQuestField) then
         candidateFields[state.currentRbcQuestField] = true
     end
 
+    local activeUpgrades = getActiveUpgradeCounts()
+    local avoidCoconutForWhite = hasWhitePollen
+        and not hasOtherColorPollen
+        and not hasExplicitPollenField
     local bestField, bestMode, bestScore
     for fieldName in pairs(candidateFields) do
-        local score, mode = scoreRbcFieldForTargets(fieldName, targets)
+        local score, mode = scoreRbcFieldForTargets(fieldName, targets, activeUpgrades)
+        score = applyRbcFieldHazardScore(fieldName, score, avoidCoconutForWhite)
         if not bestScore or score > bestScore then
             bestField, bestMode, bestScore = fieldName, mode, score
         end
     end
 
-    if bestField and isValidFarmField(state.currentRbcQuestField)
+    local taskSignature = table.concat(taskSignatureParts, "|")
+    if bestField and taskSignature == state.lastRbcTaskSignature
+        and isValidFarmField(state.currentRbcQuestField)
         and bestField ~= state.currentRbcQuestField
-        and (os.clock() - state.lastRbcFieldSwitchAt) < 5 then
-        local currentScore, currentMode = scoreRbcFieldForTargets(state.currentRbcQuestField, targets)
-        if currentScore > 0 and bestScore < currentScore + 160 then
+        and (os.clock() - state.lastRbcFieldSwitchAt) < 0.75 then
+        local currentScore, currentMode = scoreRbcFieldForTargets(state.currentRbcQuestField, targets, activeUpgrades)
+        if currentScore > 0 and bestScore < currentScore + 35 then
             bestField, bestMode, bestScore = state.currentRbcQuestField, currentMode, currentScore
         end
     end
@@ -8469,6 +9362,7 @@ function getAutoRbcTargetField()
     if bestField then
         if bestField ~= state.currentRbcQuestField then
             state.lastRbcFieldSwitchAt = os.clock()
+            destroyFieldRecovery()
             state.lastTokenCollectTarget = ""
             clearActiveTokenTarget(false)
             state.tokenQueue = {}
@@ -8479,15 +9373,7 @@ function getAutoRbcTargetField()
         state.currentRbcQuestField = bestField
         state.currentRbcQuestMode = bestMode or "field"
         state.selectedFarmField = bestField
-        state.lastRbcTaskSignature = table.concat((function()
-            local texts = {}
-            for _, target in ipairs(targets) do
-                if not target.complete then
-                    table.insert(texts, (normalizeFieldText(target.text)))
-                end
-            end
-            return texts
-        end)(), "|")
+        state.lastRbcTaskSignature = taskSignature
         return bestField, state.currentRbcQuestMode
     end
 
@@ -8534,13 +9420,8 @@ function stepAutoRbc()
     if observedRound > 0 then
         state.lastObservedRbcRound = observedRound
     end
-    setCollectorInputHeld(roundRunning)
+    setCollectorInputHeld(roundRunning and not state.convertingAtHive)
     setAutoRbcWalkSpeed(roundRunning)
-
-    if state.moveInProgress then
-        task.wait(0.25)
-        return
-    end
 
     if roundRunning then
         clearChallengeInfoWait()
@@ -8548,80 +9429,125 @@ function stepAutoRbc()
         if not fieldName then
             state.detected.status = "Auto RBC round running; field unknown"
             pushUi()
-            task.wait(0.45)
+            task.wait(0.08)
+            return
+        end
+        if questMode ~= "convert" then
+            state.convertingAtHive = false
+            state.convertBagTarget = 0
+        end
+
+        local moveSignature = "field::" .. fieldName
+        if state.moveInProgress then
+            local session = runtime.moveSession
+            if questMode == "convert"
+                and session
+                and session.destinationKey == "hive_convert"
+                and state.convertingAtHive then
+                task.wait(0.03)
+                return
+            end
+            local stale = not session
+                or (os.clock() - (session.lastHeartbeat or 0)) > 0.5
+                or session.destinationKey ~= moveSignature
+            if stale then
+                stopMoveSession()
+            else
+                task.wait(0.03)
+                return
+            end
+        end
+
+        if questMode == "convert" and stepConvertQuestIfNeeded() then
+            task.wait(0.03)
             return
         end
 
+        if keepCharacterAlignedToFarmField(fieldName) then
+            state.detected.status = "Aligning safely to " .. fieldName
+            task.wait(0.03)
+            return
+        end
 
         -- Target Practice marks can remain in the previous field after an
         -- objective switch. Finish owned marks before routing to the next field.
         if stepAutoPrecise(fieldName) then
-            task.wait(0.08)
+            task.wait(0.02)
             return
         end
 
         -- Precise marks have a short lifetime and directly accelerate pollen
         -- collection. Combat is therefore considered only after owned marks.
-        if stepRbcCombat(observedRound) then
-            task.wait(0.12)
+        if stepRbcCombat(observedRound, fieldName) then
+            task.wait(0.04)
             return
         end
 
         if isStandingAtFarmField(fieldName) then
             placeRbcSprinkler(fieldName)
             if stepSmartRbcMaterials(roundSummary, fieldName) then
-                task.wait(0.12)
+                task.wait(0.04)
             end
-            if questMode == "convert" and stepConvertQuestIfNeeded() then
-                task.wait(0.35)
-                return
-            end
-
             if stepTokenCollectorInField(fieldName) then
-                task.wait(0.15)
+                task.wait(0.02)
                 return
             end
 
             state.detected.status = "Auto RBC farming " .. fieldName
                 .. ((roundSummary and roundSummary.round > 0) and (" | round " .. tostring(roundSummary.round)) or "")
             pushUi()
-            task.wait(0.6)
+            task.wait(0.1)
             return
         end
 
         local now = os.clock()
-        local moveSignature = "field::" .. fieldName
-        if state.lastAutoRbcMoveTarget ~= moveSignature or (now - state.lastAutoRbcMoveAt) >= 2.5 then
+        if state.lastAutoRbcMoveTarget ~= moveSignature or (now - state.lastAutoRbcMoveAt) >= 0.35 then
             state.lastAutoRbcMoveTarget = moveSignature
             state.lastAutoRbcMoveAt = now
             tweenToFarmField(fieldName)
         else
-            task.wait(0.25)
+            task.wait(0.03)
         end
         return
     end
 
+    state.convertingAtHive = false
+    state.convertBagTarget = 0
+
+    if state.moveInProgress then
+        local session = runtime.moveSession
+        local stale = not session
+            or (os.clock() - (session.lastHeartbeat or 0)) > 0.5
+            or session.destinationKey ~= "robo_bear_circle"
+        if stale then
+            stopMoveSession()
+        else
+            task.wait(0.03)
+            return
+        end
+    end
+
     if isLiveRoboBearChallengeUiVisible() or isNpcDialogOpen() or isWaitingForChallengeInfo() or isRoboBearChallengePromptOpen() then
-        task.wait(0.35)
+        task.wait(0.05)
         return
     end
 
     if not isStandingAtRoboBearCircle() then
         local now = os.clock()
         local moveSignature = "robo_bear_circle"
-        if state.lastAutoRbcMoveTarget ~= moveSignature or (now - state.lastAutoRbcMoveAt) >= 2.5 then
+        if state.lastAutoRbcMoveTarget ~= moveSignature or (now - state.lastAutoRbcMoveAt) >= 0.35 then
             state.lastAutoRbcMoveTarget = moveSignature
             state.lastAutoRbcMoveAt = now
             tweenToRoboBearCircle()
         else
-            task.wait(0.25)
+            task.wait(0.03)
         end
         return
     end
 
     state.detected.status = "Auto RBC ready at Robo Bear circle"
     pushUi()
-    task.wait(0.45)
+    task.wait(0.08)
 end
 
 function runRoboBearInteractLoop()
@@ -8632,7 +9558,7 @@ function runRoboBearInteractLoop()
             if state.autoRoboBearInteract then
                 stepRoboBearInteract()
             else
-                task.wait(0.4)
+                task.wait(0.1)
             end
         end)
     end
@@ -8648,11 +9574,13 @@ function runAutoRbcLoop()
             else
                 setCollectorInputHeld(false)
                 setAutoRbcWalkSpeed(false)
-                task.wait(0.4)
+                task.wait(0.1)
             end
         end)
     end
 end
+
+installRbcUiWakeListeners()
 
 task.spawn(function()
     runAutoScanLoop()

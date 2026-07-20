@@ -1,9 +1,8 @@
 # Bee Swarm RBC Automation
 
-Robo Bear Challenge automation for Bee Swarm Simulator. The existing automation file is the entry point:
+Robo Bear Challenge automation for Bee Swarm Simulator. The automation entry point is:
 
 - `rbc_quest_detector_no_atlas (1).lua`
-- `bss-align-field-farm.client.lua` is retained as the field-alignment reference used during development.
 
 ## Automated Flow
 
@@ -13,8 +12,10 @@ Robo Bear Challenge automation for Bee Swarm Simulator. The existing automation 
 - Adapts upgrade choices to the selected quest, current round, attack, capacity, and active Homepage level.
 - Routes multi-color pollen quests through overlapping fields, then switches fields as objectives complete.
 - Runs the game's `Collectors.LocalCollect` loop while farming, which fires the real `ToolCollect` remote at the equipped collector's cooldown, and places sprinklers after entering a field.
-- Uses a persistent, priority-aware token queue with strict field bounds and stall pathfinding.
-- Finishes owned Precise crosshairs before changing fields.
+- Detects token spawns immediately, rebuilds its priority route without the old polling delay, and recovers stalled token movement.
+- Reads live Precise target state plus `Precision` and `Precise Mark` buff stacks to build x10 Precision, cap gifted marks at x3, and refresh expiring stacks.
+- Scores fields from the live game's tier-weighted flower composition and active RBC field upgrades, then switches as individual pollen objectives complete.
+- Cancels or recovers stale field/Robo Bear movement sessions instead of remaining stuck in a tween.
 - Uses quest-aware materials only when they solve a current weakness: color extracts, emergency late-round potions, field dice, goo support, and instant conversion.
 - Limits Golden Cogmower chases to rounds below 20 and focuses objective Mechsquitos without sacrificing short-lived Precise marks.
 - Limits upgrade rerolls to one per round and only after an upgrade was purchased.
@@ -29,9 +30,11 @@ These policies were derived from the supplied RBC guide and compared against a l
 
 ## Runtime Requirements
 
-The script expects executor APIs used by the existing project, including filesystem config access, `getgc`, `getconnections`, `firetouchinterest`, and virtual input support. Execute the main Lua file in an active Bee Swarm Simulator client, then enable `Auto RBC` in the overlay.
+The script expects executor APIs used by the existing project, including filesystem config access, `getgc`, `getconnections`, and virtual input support. It does not use touch simulation or character teleports. Execute the main Lua file in an active Bee Swarm Simulator client, then enable `Auto RBC` in the overlay.
 
 The generated `rbc_quest_detector_config.json` file is local runtime state and is not committed.
+
+Press Right Shift to show or hide the overlay.
 
 ## Validation
 
