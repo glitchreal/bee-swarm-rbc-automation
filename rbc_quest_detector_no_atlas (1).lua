@@ -14,7 +14,7 @@ end
 
 local playerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-local SCRIPT_VERSION = "2026.07.19.18"
+local SCRIPT_VERSION = "2026.07.27.23"
 local INSTANCE_KEY = "__RBCQuestDetectorNoAtlas"
 local TWEEN_SPEED_MIN = 20
 local TWEEN_SPEED_MAX = 70
@@ -28,6 +28,9 @@ local TOKEN_REPATH_INTERVAL = 0.04
 local TOKEN_TARGET_TIMEOUT = 3
 local PRECISION_REFRESH_SECONDS = 12
 local TWEEN_TRAVEL_CLEARANCE = 14
+local GUI_CACHE_INTERVAL = 0.25
+local UI_PUSH_INTERVAL = 0.25
+local RBC_ROUTE_REFRESH_INTERVAL = 0.35
 local globalScope = (getgenv and getgenv()) or _G
 local previousInstance = globalScope[INSTANCE_KEY]
 
@@ -153,6 +156,7 @@ local state = {
     lastFarmStallRecoverAt = 0,
     lastRbcFieldSwitchAt = 0,
     lastRbcTaskSignature = "",
+    lastAutoRbcRouteAt = 0,
     activeRbcTaskKey = "",
     lastChallengeTimerSeconds = nil,
     lastChallengeTimerChangedAt = 0,
@@ -309,7 +313,8 @@ local EMPTY_TABLE = {}
 local remoteCache = {}
 local guiCache = {
     descendants = setmetatable({}, { __mode = "k" }),
-    paths = setmetatable({}, { __mode = "k" })
+    paths = setmetatable({}, { __mode = "k" }),
+    refreshedAt = 0
 }
 
 function safeCall(fn, fallback)
@@ -320,9 +325,14 @@ function safeCall(fn, fallback)
     return fallback
 end
 
-function resetGuiCache()
+function resetGuiCache(force)
+    local now = os.clock()
+    if not force and (now - (guiCache.refreshedAt or 0)) < GUI_CACHE_INTERVAL then
+        return
+    end
     guiCache.descendants = setmetatable({}, { __mode = "k" })
     guiCache.paths = setmetatable({}, { __mode = "k" })
+    guiCache.refreshedAt = now
 end
 
 function getCachedDescendants(instance)
@@ -2304,12 +2314,19 @@ function isStandingAtFarmField(fieldName)
         return false
     end
 
+    local field = findFarmFieldInstance(fieldName)
+    if field and field:IsA("BasePart") then
+        local localPosition = field.CFrame:PointToObjectSpace(rootPart.Position)
+        return math.abs(localPosition.X) <= field.Size.X * 0.5 + 6
+            and math.abs(localPosition.Z) <= field.Size.Z * 0.5 + 6
+            and localPosition.Y >= field.Size.Y * 0.5 + 0.5
+            and localPosition.Y <= field.Size.Y * 0.5 + 16
+    end
+
     local delta = rootPart.Position - center
-    local horizontalDistance = Vector3.new(delta.X, 0, delta.Z).Magnitude
-    local radius = math.max(size.X, size.Z) / 2
-    local fieldSurfaceY = center.Y + size.Y / 2
-    return horizontalDistance <= (radius + 6)
-        and rootPart.Position.Y >= fieldSurfaceY + 0.5
+    return math.abs(delta.X) <= size.X * 0.5 + 6
+        and math.abs(delta.Z) <= size.Z * 0.5 + 6
+        and rootPart.Position.Y >= center.Y + size.Y * 0.5 + 0.5
         and rootPart.Position.Y <= targetPosition.Y + 12
 end
 
@@ -2704,6 +2721,11 @@ function setAutoRbcWalkSpeed(enabled)
                 if not isRuntimeActive() or not state.autoRbc then
                     return
                 end
+                local now = os.clock()
+                if (now - (runtime.lastWalkSpeedEnforceAt or 0)) < 0.2 then
+                    return
+                end
+                runtime.lastWalkSpeedEnforceAt = now
                 local currentHumanoid = getCharacterHumanoid()
                 if not currentHumanoid then
                     return
@@ -3244,6 +3266,25 @@ function moveHumanoidToPosition(position)
         return true
     end
     return false
+end
+
+function cancelAutoRbcWalkTargets()
+    clearActiveTokenTarget(false)
+    state.tokenQueue = {}
+    state.tokenQueueField = ""
+    state.tokenQueueDirty = true
+    state.combatTarget = nil
+    state.combatTargetStartedAt = 0
+    state.lastFarmRootPosition = nil
+    state.lastFarmMovementAt = 0
+    state.farmPatrolIndex = 0
+
+    local humanoid = getCharacterHumanoid()
+    if humanoid then
+        pcall(function()
+            humanoid:Move(Vector3.zero, false)
+        end)
+    end
 end
 
 function recoverFarmMovementIfStalled(targetPosition)
@@ -3789,11 +3830,26 @@ function getClaimedHiveTargetPosition()
 
     local hivePlatforms = Workspace:FindFirstChild("HivePlatforms")
     if hivePlatforms then
+        -- In the live client Transient.ClaimedHive is a boolean. PlayerRef is
+        -- the authoritative replicated owner for each platform.
+        for _, platform in ipairs(hivePlatforms:GetChildren()) do
+            local playerRef = platform:FindFirstChild("PlayerRef")
+            if playerRef and playerRef:IsA("ObjectValue") and playerRef.Value == LocalPlayer then
+                local center, size = getInstanceCenterAndSize(platform)
+                if center and size then
+                    return center + Vector3.new(0, math.max(4, size.Y / 2 + 4), 0)
+                end
+            end
+        end
+
+        local claimedHiveName = (type(claimedHive) == "string" or type(claimedHive) == "number")
+            and tostring(claimedHive)
+            or nil
         for _, platform in ipairs(hivePlatforms:GetChildren()) do
             local hiveValue = platform:FindFirstChild("Hive")
-            local matchesClaim = not claimedHive
-                or tostring(platform.Name) == tostring(claimedHive)
-                or (hiveValue and hiveValue.Value and tostring(hiveValue.Value.Name) == tostring(claimedHive))
+            local matchesClaim = claimedHiveName
+                and (tostring(platform.Name) == claimedHiveName
+                    or (hiveValue and hiveValue.Value and tostring(hiveValue.Value.Name) == claimedHiveName))
             if matchesClaim then
                 local center, size = getInstanceCenterAndSize(platform)
                 if center and size then
@@ -3804,7 +3860,7 @@ function getClaimedHiveTargetPosition()
     end
 
     local honeycombs = Workspace:FindFirstChild("Honeycombs")
-    if honeycombs and claimedHive then
+    if honeycombs and (type(claimedHive) == "string" or type(claimedHive) == "number") then
         local hive = honeycombs:FindFirstChild(tostring(claimedHive))
         local center, size = getInstanceCenterAndSize(hive)
         if center and size then
@@ -3825,6 +3881,7 @@ function tweenToHiveForConversion()
         return runtime.moveSession and runtime.moveSession.destinationKey == "hive_convert"
     end
 
+    cancelAutoRbcWalkTargets()
     stopMoveSession()
     destroyFieldRecovery()
     local session = {
@@ -4022,6 +4079,9 @@ function setCharacterNoclip(enabled, session)
     end
 
     if enabled then
+        if session.noclipEnabled then
+            return
+        end
         session.partCollision = session.partCollision or {}
         session.noclipEnabled = true
         for _, descendant in ipairs(character:GetDescendants()) do
@@ -4045,20 +4105,19 @@ function setCharacterNoclip(enabled, session)
         end
 
         if not session.noclipStepConnection then
-            session.noclipStepConnection = RunService.Stepped:Connect(function()
+            session.lastNoclipRefreshAt = 0
+            session.noclipStepConnection = RunService.Heartbeat:Connect(function()
                 if session.cancelled or not session.noclipEnabled then
                     return
                 end
-                local currentCharacter = LocalPlayer.Character
-                if not currentCharacter then
+                local now = os.clock()
+                if (now - (session.lastNoclipRefreshAt or 0)) < 0.2 then
                     return
                 end
-                for _, descendant in ipairs(currentCharacter:GetDescendants()) do
-                    if descendant:IsA("BasePart") then
-                        if session.partCollision[descendant] == nil then
-                            session.partCollision[descendant] = descendant.CanCollide
-                        end
-                        descendant.CanCollide = false
+                session.lastNoclipRefreshAt = now
+                for part in pairs(session.partCollision) do
+                    if part and part.Parent and part.CanCollide then
+                        part.CanCollide = false
                     end
                 end
             end)
@@ -4178,6 +4237,7 @@ function tweenToRoboBearCircle()
         return false
     end
 
+    cancelAutoRbcWalkTargets()
     stopMoveSession()
 
     local function getCircleTargetPosition()
@@ -4296,6 +4356,7 @@ function tweenToFarmField(fieldName)
         return false
     end
 
+    cancelAutoRbcWalkTargets()
     stopMoveSession()
 
     local session = {
@@ -7930,10 +7991,10 @@ function pushUi(force)
     end
 
     local now = os.clock()
-    if not force and (now - (runtime.lastUiPushAt or 0)) < 0.08 then
+    if not force and (now - (runtime.lastUiPushAt or 0)) < UI_PUSH_INTERVAL then
         if not runtime.uiPushQueued then
             runtime.uiPushQueued = true
-            task.delay(0.08, function()
+            task.delay(UI_PUSH_INTERVAL, function()
                 if isRuntimeActive() then
                     runtime.uiPushQueued = false
                     pushUi(true)
@@ -7997,7 +8058,7 @@ function refreshDetection()
     end
 
     state.refreshInProgress = true
-    resetGuiCache()
+    resetGuiCache(true)
     local guiData = scanGuiForQuestData()
     local guiCandidate = guiData and guiData.best or nil
     local visibleBeeChoices = findVisibleBeeChoices()
@@ -8822,7 +8883,7 @@ function runAutoScanLoop()
             if state.autoScan then
                 local waitTime = state.scanInterval
                 if state.autoBeePick or state.autoUpgradePick then
-                    waitTime = 0.1
+                    waitTime = 0.2
                 end
                 task.wait(waitTime)
                 if state.autoScan and not state.refreshInProgress then
@@ -9284,6 +9345,13 @@ function scoreRbcFieldForTargets(fieldName, targets, activeUpgrades)
 end
 
 function getAutoRbcTargetField()
+    local now = os.clock()
+    if isValidFarmField(state.currentRbcQuestField)
+        and (now - (state.lastAutoRbcRouteAt or 0)) < RBC_ROUTE_REFRESH_INTERVAL then
+        return state.currentRbcQuestField, state.currentRbcQuestMode or "field"
+    end
+    state.lastAutoRbcRouteAt = now
+
     local allTargets = getVisibleRbcTaskTargets()
     local targets = {}
     local primaryTaskKey = ""
@@ -9364,11 +9432,7 @@ function getAutoRbcTargetField()
             state.lastRbcFieldSwitchAt = os.clock()
             destroyFieldRecovery()
             state.lastTokenCollectTarget = ""
-            clearActiveTokenTarget(false)
-            state.tokenQueue = {}
-            state.tokenQueueField = ""
-            state.lastFarmRootPosition = nil
-            state.farmPatrolIndex = 0
+            cancelAutoRbcWalkTargets()
         end
         state.currentRbcQuestField = bestField
         state.currentRbcQuestMode = bestMode or "field"
@@ -9463,11 +9527,22 @@ function stepAutoRbc()
             return
         end
 
-        if keepCharacterAlignedToFarmField(fieldName) then
-            state.detected.status = "Aligning safely to " .. fieldName
-            task.wait(0.03)
+        -- Field acquisition is exclusive: no Precise, combat, token, patrol,
+        -- pathfinding, or recovery walk may run until the selected field's
+        -- arrival predicate is true.
+        if not isStandingAtFarmField(fieldName) then
+            destroyFieldRecovery()
+            cancelAutoRbcWalkTargets()
+            local now = os.clock()
+            if state.lastAutoRbcMoveTarget ~= moveSignature or (now - state.lastAutoRbcMoveAt) >= 0.35 then
+                state.lastAutoRbcMoveTarget = moveSignature
+                state.lastAutoRbcMoveAt = now
+                tweenToFarmField(fieldName)
+            end
+            task.wait(0.05)
             return
         end
+        destroyFieldRecovery()
 
         -- Target Practice marks can remain in the previous field after an
         -- objective switch. Finish owned marks before routing to the next field.
@@ -9483,31 +9558,19 @@ function stepAutoRbc()
             return
         end
 
-        if isStandingAtFarmField(fieldName) then
-            placeRbcSprinkler(fieldName)
-            if stepSmartRbcMaterials(roundSummary, fieldName) then
-                task.wait(0.04)
-            end
-            if stepTokenCollectorInField(fieldName) then
-                task.wait(0.02)
-                return
-            end
-
-            state.detected.status = "Auto RBC farming " .. fieldName
-                .. ((roundSummary and roundSummary.round > 0) and (" | round " .. tostring(roundSummary.round)) or "")
-            pushUi()
-            task.wait(0.1)
+        placeRbcSprinkler(fieldName)
+        if stepSmartRbcMaterials(roundSummary, fieldName) then
+            task.wait(0.04)
+        end
+        if stepTokenCollectorInField(fieldName) then
+            task.wait(0.04)
             return
         end
 
-        local now = os.clock()
-        if state.lastAutoRbcMoveTarget ~= moveSignature or (now - state.lastAutoRbcMoveAt) >= 0.35 then
-            state.lastAutoRbcMoveTarget = moveSignature
-            state.lastAutoRbcMoveAt = now
-            tweenToFarmField(fieldName)
-        else
-            task.wait(0.03)
-        end
+        state.detected.status = "Auto RBC farming " .. fieldName
+            .. ((roundSummary and roundSummary.round > 0) and (" | round " .. tostring(roundSummary.round)) or "")
+        pushUi()
+        task.wait(0.1)
         return
     end
 
